@@ -1,0 +1,24 @@
+# Core deep learning and transformers
+torch>=2.0.0
+transformers>=4.37.0
+accelerate>=0.26.0
+
+# Qwen-specific packages
+qwen-vl-utils
+tiktoken
+
+# Video processing
+decord>=0.6.0
+opencv-python>=4.8.0
+av
+
+# Data and utilities
+pandas>=2.0.0
+numpy>=1.24.0
+pillow>=10.0.0
+tqdm
+datasets
+huggingface-hub
+
+# Optional: Performance optimizations
+einops

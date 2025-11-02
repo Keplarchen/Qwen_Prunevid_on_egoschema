@@ -1,0 +1,33 @@
+# 数据集和模型文件
+models/
+downloads/
+hub/
+datasets--*/
+egoschema/
+results/
+*.lock
+
+# Python 环境
+envs/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.Python
+venv/
+ENV/
+
+# 临时文件和缓存
+.locks/
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 其他
+oldfile/
+TimeChat-Online/
+xet/
+=4.42.0
