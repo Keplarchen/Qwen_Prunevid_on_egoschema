@@ -1127,6 +1127,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         # PruneVid集成
         self.prunevid_config = prunevid_config
         self.prunevid_stage1 = None
+        self.prunevid_stage2 = None
         self.prunevid_stats = {}
         if prunevid_config is not None and prunevid_config.enable_stage1:
             # 延迟导入避免循环依赖
@@ -1134,6 +1135,12 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             self.prunevid_stage1 = SpatialTemporalTokenMerger(prunevid_config)
             if prunevid_config.verbose:
                 print(f"[PruneVid] Stage 1 已初始化")
+
+        if prunevid_config is not None and prunevid_config.enable_stage2:
+            from stage2_attention_selection import AttentionBasedTokenSelector
+            self.prunevid_stage2 = AttentionBasedTokenSelector(prunevid_config)
+            if prunevid_config.verbose:
+                print(f"[PruneVid] Stage 2 已初始化 (layer={prunevid_config.pruning_layer}, keep_ratio={prunevid_config.keep_ratio})")
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -1210,6 +1217,117 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                   f"reduction: {(seq_len - new_seq_len) / seq_len * 100:.1f}%")
 
         return new_hidden_states, new_position_embeddings, new_position_ids
+
+    def apply_stage2(
+        self,
+        hidden_states: torch.Tensor,
+        attn_weights: torch.Tensor,
+        position_ids: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        visual_token_start: int,
+        visual_token_end: int,
+    ):
+        """
+        PruneVid Stage 2: 基于注意力的Token选择
+
+        Args:
+            hidden_states: [batch, seq_len, hidden_dim]
+            attn_weights: [batch, num_heads, seq_len, seq_len]
+            position_ids: [3, batch, seq_len]
+            position_embeddings: (cos, sin)
+            attention_mask: causal mask
+            visual_token_start: 视觉token起始位置
+            visual_token_end: 视觉token结束位置
+
+        Returns:
+            updated tensors and stats
+        """
+        # 使用stage2选择器分析attention并选择token
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+
+        # 提取交叉注意力：文本token → 视觉token
+        # 文本token在视觉token之前
+        text_token_end = visual_token_start
+        text_token_start = 0
+
+        if text_token_end <= text_token_start:
+            # 没有文本token，跳过Stage 2
+            return hidden_states, position_ids, position_embeddings, attention_mask, {}
+
+        # [batch, num_heads, num_text, num_visual]
+        cross_attention = attn_weights[:, :, text_token_start:text_token_end, visual_token_start:visual_token_end]
+
+        # 计算每个视觉token的重要性分数
+        num_visual = cross_attention.shape[3]
+
+        if self.prunevid_config.attention_aggregation == "max":
+            # Max over 文本token维度
+            max_over_text = cross_attention.max(dim=2)[0]  # [batch, num_heads, num_visual]
+            # Max over attention heads
+            importance_scores = max_over_text.max(dim=1)[0]  # [batch, num_visual]
+        else:  # mean
+            mean_over_text = cross_attention.mean(dim=2)
+            importance_scores = mean_over_text.mean(dim=1)
+
+        # 选择top-k (支持batch处理)
+        num_to_keep = max(1, int(num_visual * self.prunevid_config.keep_ratio))
+
+        # 处理每个batch样本
+        selected_indices_list = []
+        for b in range(batch_size):
+            scores_b = importance_scores[b]  # [num_visual]
+            _, top_k_indices = torch.topk(scores_b, num_to_keep, largest=True)
+            # 转换为全局索引并排序
+            global_indices = top_k_indices + visual_token_start
+            global_indices_sorted, _ = torch.sort(global_indices)
+            selected_indices_list.append(global_indices_sorted)
+
+        # 假设所有batch选择的位置相同（通常情况）
+        selected_indices = selected_indices_list[0]
+
+        if self.prunevid_config.verbose:
+            print(f"[Stage 2] 选择 {num_to_keep}/{num_visual} 视觉tokens ({self.prunevid_config.keep_ratio*100:.1f}%)")
+
+        # 重新组织序列：[文本前] + [选中的视觉] + [文本后]
+        text_before_indices = torch.arange(0, visual_token_start, device=hidden_states.device)
+
+        # 检查是否有文本tokens在视觉tokens之后
+        if visual_token_end < seq_len:
+            text_after_indices = torch.arange(visual_token_end, seq_len, device=hidden_states.device)
+            all_indices = torch.cat([text_before_indices, selected_indices, text_after_indices])
+        else:
+            # 没有文本tokens在视觉tokens之后
+            all_indices = torch.cat([text_before_indices, selected_indices])
+
+        # 更新hidden_states
+        new_hidden_states = hidden_states[:, all_indices, :]
+
+        # 更新position_ids
+        new_position_ids = position_ids[:, :, all_indices]
+
+        # 更新position_embeddings
+        cos, sin = position_embeddings
+        new_cos = cos[:, :, all_indices, :]
+        new_sin = sin[:, :, all_indices, :]
+        new_position_embeddings = (new_cos, new_sin)
+
+        # 更新attention_mask
+        new_attention_mask = None
+        if attention_mask is not None:
+            # attention_mask shape可能是[batch, 1, seq_len, seq_len]或其他
+            if attention_mask.dim() == 4:
+                new_attention_mask = attention_mask[:, :, all_indices, :][:, :, :, all_indices]
+            else:
+                new_attention_mask = attention_mask
+
+        # 统计信息
+        from utils import compute_compression_stats
+        stats = compute_compression_stats(num_visual, num_to_keep)
+        stats['num_text_before'] = visual_token_start
+        stats['num_text_after'] = seq_len - visual_token_end
+
+        return new_hidden_states, new_position_ids, new_position_embeddings, new_attention_mask, stats
 
     def token_drop(
         self,
@@ -1577,9 +1695,36 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        # Stage 2: 跟踪是否需要在pruning_layer提取attention
+        stage2_should_extract = (
+            self.prunevid_stage2 is not None and
+            input_ids is not None and
+            self.config.vision_start_token_id in input_ids[0]
+        )
+        stage2_applied = False
+
+        # 如果启用了Stage 1，记录原始序列长度和视觉token后的文本长度
+        # 这些信息在Stage 2中需要用来计算新的视觉token位置
+        original_seq_len = None
+        original_text_after_len = None
+        if self.prunevid_stage1 is not None and input_ids is not None:
+            original_seq_len = hidden_states.shape[1]
+            vision_start_token_id = self.config.vision_start_token_id
+            vision_end_token_id = self.config.vision_end_token_id
+            sample_input_ids = input_ids[0].squeeze(0) if input_ids.dim() > 2 else input_ids[0]
+            vision_end_indices = (sample_input_ids == vision_end_token_id).nonzero(as_tuple=True)[0]
+            if len(vision_end_indices) > 0:
+                original_visual_end = vision_end_indices[0].item()
+                original_text_after_len = original_seq_len - original_visual_end
+
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            # Stage 2: 如果到达pruning_layer，需要提取attention
+            layer_output_attentions = output_attentions
+            if stage2_should_extract and layer_idx == self.prunevid_config.pruning_layer:
+                layer_output_attentions = True  # 强制输出attention
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -1588,7 +1733,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     causal_mask,
                     position_ids,
                     past_key_values,
-                    output_attentions,
+                    layer_output_attentions,
                     use_cache,
                     cache_position,
                     position_embeddings,
@@ -1599,7 +1744,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
-                    output_attentions=output_attentions,
+                    output_attentions=layer_output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
@@ -1608,10 +1753,54 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                next_decoder_cache = layer_outputs[2 if layer_output_attentions else 1]
 
+            # 只在用户真正要求output_attentions时才添加
+            # Stage 2可能会在单个层强制输出attention，但不应添加到all_self_attns
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+
+            # Stage 2: 在pruning_layer之后应用token selection
+            if stage2_should_extract and layer_idx == self.prunevid_config.pruning_layer and not stage2_applied:
+                # 提取attention weights
+                attn_weights = layer_outputs[1]  # [batch, num_heads, seq_len, seq_len]
+
+                # 找到视觉token的位置
+                # 注意：如果Stage 1已经执行，视觉token的位置会改变
+                vision_start_token_id = self.config.vision_start_token_id
+                sample_input_ids = input_ids[0].squeeze(0) if input_ids.dim() > 2 else input_ids[0]
+                vision_start_indices = (sample_input_ids == vision_start_token_id).nonzero(as_tuple=True)[0]
+
+                if len(vision_start_indices) > 0:
+                    visual_start = vision_start_indices[0].item() + 1
+
+                    # 计算visual_end：如果Stage 1执行了，需要基于当前seq_len计算
+                    current_seq_len = hidden_states.shape[1]
+                    if original_text_after_len is not None:
+                        # Stage 1已执行，使用新的位置
+                        visual_end = current_seq_len - original_text_after_len
+                    else:
+                        # Stage 1未执行，使用原始位置
+                        vision_end_token_id = self.config.vision_end_token_id
+                        vision_end_indices = (sample_input_ids == vision_end_token_id).nonzero(as_tuple=True)[0]
+                        if len(vision_end_indices) > 0:
+                            visual_end = vision_end_indices[0].item()
+                        else:
+                            visual_end = visual_start  # 没有视觉token
+
+                    if visual_end > visual_start:
+                        # 应用Stage 2
+                        hidden_states, position_ids, position_embeddings, causal_mask, stage2_stats = self.apply_stage2(
+                            hidden_states=hidden_states,
+                            attn_weights=attn_weights,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                            attention_mask=causal_mask,
+                            visual_token_start=visual_start,
+                            visual_token_end=visual_end,
+                        )
+                        self.prunevid_stats['stage2'] = stage2_stats
+                        stage2_applied = True
 
         hidden_states = self.norm(hidden_states)
 
