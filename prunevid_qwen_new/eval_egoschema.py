@@ -18,7 +18,7 @@ from datasets import load_dataset
 # ============================================================================
 
 # GPU配置
-GPU_ID = 0  # 使用哪块GPU（0, 1, 2, ...）
+GPU_ID = 2 # 使用哪块GPU（0, 1, 2, ...）
 DEVICE = f"cuda:{GPU_ID}"
 
 # 数据集配置
@@ -31,35 +31,35 @@ DATASET_SPLIT = "test"  # 'test' or 'validation'
 MODEL_PATH = "Qwen/Qwen2.5-VL-7B-Instruct"  # Qwen2.5-VL模型路径（可以是HF ID或本地路径）
 
 # PruneVid配置模式
-CONFIG_MODE = "paper"  # 可选: "baseline", "paper", "conservative", "aggressive", "custom"
+CONFIG_MODE = "custom"  # 可选: "baseline", "paper", "conservative", "aggressive", "custom"
 
 # 自定义配置（仅当CONFIG_MODE="custom"时使用）
 # Stage 1: 时空Token合并
-CUSTOM_ENABLE_STAGE1 = True
+CUSTOM_ENABLE_STAGE1 = False
 CUSTOM_TAU = 0.8  # 静态/动态分离阈值 (0.6-0.9)
 CUSTOM_CLUSTER_RATIO = 0.5  # 空间聚类保留比例 (0.3-0.7)
 CUSTOM_TEMPORAL_SEGMENT_RATIO = 0.25  # 时序分段比例 (0.125-0.5)
 CUSTOM_DPC_KNN_K = 5  # DPC-KNN的k近邻参数
 
 # Stage 2: 基于注意力的Token选择
-CUSTOM_ENABLE_STAGE2 = True
-CUSTOM_KEEP_RATIO = 0.5  # Token保留比例 (0.2-0.6)
+CUSTOM_ENABLE_STAGE2 = False   
+CUSTOM_KEEP_RATIO = 0.3  # Token保留比例 (0.2-0.6)
 CUSTOM_PRUNING_LAYER = 10  # 在哪一层进行剪枝 (5-15)
 CUSTOM_ATTENTION_AGGREGATION = "max"  # 'max' or 'mean'
 
 # Stage 3: KV缓存压缩
-CUSTOM_ENABLE_CACHE_COMPRESSION = True
+CUSTOM_ENABLE_CACHE_COMPRESSION = False
 
 # 视频处理配置
 MAX_FRAMES = 16  # 最大帧数 (8, 16, 32)
 
 # 生成配置
-MAX_NEW_TOKENS = 10  # EgoSchema是选择题，答案很短
+MAX_NEW_TOKENS = 10  # 给模型充分空间解释答案（去掉限制）
 TEMPERATURE = 0.0  # 0表示greedy decoding
 DO_SAMPLE = False
 
 # 测试配置
-NUM_SAMPLES = 10  # 测试样本数量，None表示全部
+NUM_SAMPLES = 500  # 测试样本数量，None表示全部
 START_INDEX = 0  # 从第几个样本开始
 SAVE_RESULTS = True  # 是否保存结果
 OUTPUT_DIR = "./results"  # 结果保存目录
@@ -237,15 +237,22 @@ class EgoSchemaEvaluator:
             stage1_stats = stats.get('stage1', {})
             stage2_stats = stats.get('stage2', {})
 
-            tokens_before = stage1_stats.get('original_tokens', 0)
-            tokens_after_stage1 = stage1_stats.get('compressed_tokens', tokens_before)
-            tokens_after_stage2 = stage2_stats.get('compressed_tokens', tokens_after_stage1)
-
-            # 如果没有stage1统计，使用input_tokens
-            if tokens_before == 0:
+            # 获取原始token数量
+            if stage1_stats:
+                tokens_before = stage1_stats.get('original_tokens', 0)
+                tokens_after_stage1 = stage1_stats.get('compressed_tokens', tokens_before)
+            else:
+                # Stage 1禁用，使用input_tokens作为原始值
                 tokens_before = result.get('input_tokens', 0)
                 tokens_after_stage1 = tokens_before
-                tokens_after_stage2 = tokens_before
+
+            # 获取Stage 2后的token数量
+            if stage2_stats:
+                # Stage 2启用，使用其压缩后的值
+                tokens_after_stage2 = stage2_stats.get('compressed_tokens', tokens_after_stage1)
+            else:
+                # Stage 2禁用，保持Stage 1的值
+                tokens_after_stage2 = tokens_after_stage1
 
             # 返回结果
             return {
@@ -269,15 +276,19 @@ class EgoSchemaEvaluator:
             traceback.print_exc()
             return None
 
-    def print_sample_result(self, result: Dict):
+    def print_sample_result(self, result: Dict, total_samples: int):
         """打印单个样本的结果"""
-        print(f"\n{'='*80}")
-        print(f"Sample {result['sample_idx'] + 1}/{self.total_samples}")
+        # 打印样本信息（问题编号、视频ID、问题）
+        print(f"Sample {result['sample_idx'] + 1}/{total_samples}")
         print(f"Video ID: {result['video_id']}")
         print(f"Question: {result['question'][:100]}...")
+        print()
+
+        # 详细处理过程和压缩统计会在这里自动打印（由模型的verbose输出）
+
+        # 打印预测结果
         print(f"\nGround Truth: {result['ground_truth']}")
         print(f"Predicted:    {result['predicted_answer']}")
-        print(f"Generated:    {result['generated_text'][:100]}...")
         print(f"Correct: {'✓' if result['is_correct'] else '✗'}")
 
         # 当前累计准确率
@@ -308,7 +319,9 @@ class EgoSchemaEvaluator:
         print(f"  Stage 1 avg drop: {avg_stage1_drop:.1f}%")
         print(f"  Stage 2 avg drop: {avg_stage2_drop:.1f}%")
         print(f"  Total avg drop:   {avg_total_drop:.1f}%")
-        print(f"{'='*80}\n")
+
+        # 问题之间的分割线
+        print(f"\n{'='*80}\n")
 
     def run_evaluation(
         self,
@@ -333,8 +346,16 @@ class EgoSchemaEvaluator:
         # 评估每个样本
         start_time = time.time()
 
-        for i, sample in enumerate(tqdm(samples_to_eval, desc="Evaluating")):
+        for i, sample in enumerate(samples_to_eval):
             sample_idx = start_index + i
+            total_samples_count = len(samples_to_eval)
+
+            # 在评估前打印样本头信息
+            if VERBOSE:
+                print(f"Sample {i + 1}/{total_samples_count}")
+                print(f"Video ID: {sample['video_idx']}")
+                print(f"Question: {sample['question'][:100]}...")
+                print()
 
             # 评估样本
             result = self.evaluate_sample(sample, sample_idx)
@@ -354,9 +375,45 @@ class EgoSchemaEvaluator:
 
             self.results.append(result)
 
-            # 打印结果
+            # 打印结果（不再打印样本头信息，因为已经在前面打印了）
             if VERBOSE:
-                self.print_sample_result(result)
+                # 打印预测结果和统计信息
+                print(f"\nGround Truth: {result['ground_truth']}")
+                print(f"Predicted:    {result['predicted_answer']}")
+                print(f"Generated:    '{result['generated_text']}'")  # 显示实际生成的文本
+                print(f"Correct: {'✓' if result['is_correct'] else '✗'}")
+
+                # 当前累计准确率
+                accuracy = self.correct_samples / self.total_samples * 100
+                print(f"\n📊 Current Accuracy: {self.correct_samples}/{self.total_samples} = {accuracy:.2f}%")
+
+                # Token压缩统计
+                tokens_before = result['tokens_before']
+                tokens_after_stage1 = result['tokens_after_stage1']
+                tokens_after_stage2 = result['tokens_after_stage2']
+
+                stage1_drop = (tokens_before - tokens_after_stage1) / tokens_before * 100 if tokens_before > 0 else 0
+                stage2_drop = (tokens_after_stage1 - tokens_after_stage2) / tokens_after_stage1 * 100 if tokens_after_stage1 > 0 else 0
+                total_drop = (tokens_before - tokens_after_stage2) / tokens_before * 100 if tokens_before > 0 else 0
+
+                print(f"\n📉 Token Compression (Current Sample):")
+                print(f"  Original:      {tokens_before}")
+                print(f"  After Stage 1: {tokens_after_stage1} (drop: {stage1_drop:.1f}%)")
+                print(f"  After Stage 2: {tokens_after_stage2} (drop: {stage2_drop:.1f}%)")
+                print(f"  Total drop:    {total_drop:.1f}%")
+
+                # 累计平均压缩率
+                avg_stage1_drop = (self.total_tokens_before - self.total_tokens_after_stage1) / self.total_tokens_before * 100 if self.total_tokens_before > 0 else 0
+                avg_stage2_drop = (self.total_tokens_after_stage1 - self.total_tokens_after_stage2) / self.total_tokens_after_stage1 * 100 if self.total_tokens_after_stage1 > 0 else 0
+                avg_total_drop = (self.total_tokens_before - self.total_tokens_after_stage2) / self.total_tokens_before * 100 if self.total_tokens_before > 0 else 0
+
+                print(f"\n📉 Average Token Compression (Cumulative):")
+                print(f"  Stage 1 avg drop: {avg_stage1_drop:.1f}%")
+                print(f"  Stage 2 avg drop: {avg_stage2_drop:.1f}%")
+                print(f"  Total avg drop:   {avg_total_drop:.1f}%")
+
+                # 问题之间的分割线
+                print(f"\n{'='*80}\n")
 
         total_time = time.time() - start_time
 

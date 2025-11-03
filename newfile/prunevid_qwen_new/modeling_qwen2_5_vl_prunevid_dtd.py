@@ -51,148 +51,12 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-# 尝试从 transformers 导入配置类
-try:
-    from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
-except ImportError:
-    try:
-        from transformers import Qwen2_5_VLConfig
-        # 如果没有 VisionConfig，我们创建一个占位符
-        Qwen2_5_VLVisionConfig = None
-    except ImportError:
-        # 最后的备选方案：从 AutoConfig 获取
-        from transformers import AutoConfig
-        Qwen2_5_VLConfig = AutoConfig
-        Qwen2_5_VLVisionConfig = None
-
+from configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 import pdb
 from transformers.image_utils import (
     OPENAI_CLIP_MEAN,
     OPENAI_CLIP_STD,
 )
-
-# ======================================
-# PruneVid Stage 1: 辅助函数
-# ======================================
-
-def cluster_dpc_knn(
-    features: torch.Tensor,
-    cluster_num: int,
-    k: int = 5,
-    device: str = "cuda"
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    密度峰值聚类算法 (Density Peaks Clustering with k-Nearest Neighbors)
-
-    Args:
-        features: 特征张量，shape [N, C]
-        cluster_num: 目标聚类数量
-        k: k近邻数量
-        device: 计算设备
-
-    Returns:
-        idx_clusters: 每个样本的聚类索引，shape [N]
-        centers: 聚类中心的索引，shape [cluster_num]
-    """
-    N, C = features.shape
-    features = features.to(device)
-
-    # 1. 计算距离矩阵 [N, N]
-    original_dtype = features.dtype
-    if original_dtype == torch.bfloat16:
-        features_for_cdist = features.float()
-    else:
-        features_for_cdist = features
-
-    dist_matrix = torch.cdist(features_for_cdist, features_for_cdist, p=2)
-
-    # 2. 计算局部密度 rho（基于k近邻）
-    topk_dist, _ = torch.topk(dist_matrix, k + 1, largest=False, dim=1)
-    rho = 1.0 / (topk_dist[:, 1:k + 1].mean(dim=1) + 1e-8)
-
-    # 3. 计算决策距离 delta
-    delta = torch.zeros(N, device=device)
-    rho_sorted_idx = torch.argsort(rho, descending=True)
-
-    delta[rho_sorted_idx[0]] = dist_matrix[rho_sorted_idx[0]].max()
-
-    for i in range(1, N):
-        idx = rho_sorted_idx[i]
-        higher_density_indices = rho_sorted_idx[:i]
-        delta[idx] = dist_matrix[idx, higher_density_indices].min()
-
-    # 4. 计算gamma = rho * delta
-    gamma = rho * delta
-
-    # 5. 选择gamma最大的cluster_num个点作为聚类中心
-    _, centers = torch.topk(gamma, cluster_num, largest=True)
-    centers = centers.sort()[0]
-
-    # 6. 将其他点分配到最近的聚类中心
-    idx_clusters = torch.zeros(N, dtype=torch.long, device=device)
-    idx_clusters[centers] = torch.arange(cluster_num, device=device)
-
-    for i in range(N):
-        if i in rho_sorted_idx[:cluster_num]:
-            continue
-        idx = rho_sorted_idx[i]
-        assigned_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        assigned_mask[rho_sorted_idx[:i]] = True
-        dist_to_assigned = dist_matrix[idx].clone()
-        dist_to_assigned[~assigned_mask] = float('inf')
-        nearest_assigned = dist_to_assigned.argmin()
-        idx_clusters[idx] = idx_clusters[nearest_assigned]
-
-    return idx_clusters, centers
-
-
-def merge_tokens_by_indices(
-    tokens: torch.Tensor,
-    cluster_indices: torch.Tensor,
-    num_clusters: int,
-    method: str = "mean"
-) -> torch.Tensor:
-    """
-    根据聚类索引合并token
-    """
-    N, C = tokens.shape
-    device = tokens.device
-
-    merged_tokens = torch.zeros(num_clusters, C, device=device, dtype=tokens.dtype)
-
-    for i in range(num_clusters):
-        mask = cluster_indices == i
-        if mask.sum() == 0:
-            continue
-
-        cluster_tokens = tokens[mask]
-        if method == "mean":
-            merged_tokens[i] = cluster_tokens.mean(dim=0)
-        elif method == "max":
-            merged_tokens[i] = cluster_tokens.max(dim=0)[0]
-        else:
-            raise ValueError(f"Unknown merge method: {method}")
-
-    return merged_tokens
-
-
-def enforce_temporal_continuity(
-    cluster_indices: torch.Tensor,
-    timestamps: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    """
-    强制时序连续性约束：确保连续的帧被分配到连续的聚类
-    """
-    T = len(cluster_indices)
-    adjusted_indices = cluster_indices.clone()
-
-    for t in range(1, T - 1):
-        if adjusted_indices[t] != adjusted_indices[t - 1] and \
-           adjusted_indices[t] != adjusted_indices[t + 1] and \
-           adjusted_indices[t - 1] == adjusted_indices[t + 1]:
-            adjusted_indices[t] = adjusted_indices[t - 1]
-
-    return adjusted_indices
 
 
 if is_flash_attn_2_available():
@@ -1247,7 +1111,7 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
     Qwen2_5_VL_START_DOCSTRING,
 )
 class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
-    def __init__(self, config: Qwen2_5_VLConfig):
+    def __init__(self, config: Qwen2_5_VLConfig, prunevid_config=None):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1260,6 +1124,24 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
 
+        # PruneVid集成
+        self.prunevid_config = prunevid_config
+        self.prunevid_stage1 = None
+        self.prunevid_stage2 = None
+        self.prunevid_stats = {}
+        if prunevid_config is not None and prunevid_config.enable_stage1:
+            # 延迟导入避免循环依赖
+            from stage1_temporal_spatial_merge import SpatialTemporalTokenMerger
+            self.prunevid_stage1 = SpatialTemporalTokenMerger(prunevid_config)
+            if prunevid_config.verbose:
+                print(f"[PruneVid] Stage 1 已初始化")
+
+        if prunevid_config is not None and prunevid_config.enable_stage2:
+            from stage2_attention_selection import AttentionBasedTokenSelector
+            self.prunevid_stage2 = AttentionBasedTokenSelector(prunevid_config)
+            if prunevid_config.verbose:
+                print(f"[PruneVid] Stage 2 已初始化 (layer={prunevid_config.pruning_layer}, keep_ratio={prunevid_config.keep_ratio})")
+
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -1270,363 +1152,447 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    def spatial_temporal_token_merge(
+    def prunevid_merge(
         self,
-        tau: float = 0.8,
-        cluster_ratio: float = 0.5,
-        temporal_segment_ratio: float = 0.25,
-        dpc_knn_k: int = 5,
-        hidden_states: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        input_ids: Optional[torch.Tensor] = None,
-        video_grid_thw: Optional[torch.LongTensor] = None,
-        verbose: bool = False,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.Tensor,
+        input_ids: torch.Tensor,
     ):
         """
         PruneVid Stage 1: 时空Token合并
 
+        在视觉tokens上应用PruneVid的时空合并策略。
+
         Args:
-            tau: 静态/动态分离阈值
-            cluster_ratio: 空间聚类保留比例
-            temporal_segment_ratio: 时序分段比例
-            dpc_knn_k: DPC-KNN的k近邻参数
             hidden_states: [batch_size, seq_len, hidden_dim]
-            position_embeddings: Tuple of (pos_emb1, pos_emb2)
+            position_embeddings: ([3, batch_size, seq_len, emb_dim], [3, batch_size, seq_len, emb_dim])
             position_ids: [3, batch_size, seq_len]
-            input_ids: [batch_size, seq_len]
-            video_grid_thw: [[t, h, w], ...]
-            verbose: 是否打印详细信息
+            input_ids: [batch_size, 1, seq_len]
 
         Returns:
             merged_hidden_states: [batch_size, new_seq_len, hidden_dim]
-            merged_position_embeddings: Tuple of merged pos_emb
+            merged_position_embeddings: (cos, sin)
             merged_position_ids: [3, batch_size, new_seq_len]
         """
-        try:
-            vision_start_token_id = self.config.vision_start_token_id
-            vision_end_token_id = self.config.vision_end_token_id
-
-            batch_size, seq_len, hidden_dim = hidden_states.shape
-            device = hidden_states.device
-
-            # 假设 batch_size = 1（简化处理）
-            if batch_size != 1:
-                if verbose:
-                    print(f"[Stage 1] Batch size {batch_size} > 1, skipping merging")
-                return hidden_states, position_embeddings, position_ids
-
-            # 安全检查：确保输入维度正确
-            if position_ids.shape[0] != 3 or position_ids.shape[1] != batch_size:
-                if verbose:
-                    print(f"[Stage 1] Invalid position_ids shape: {position_ids.shape}, skipping")
-                return hidden_states, position_embeddings, position_ids
-        except Exception as e:
-            if verbose:
-                print(f"[Stage 1] Error in initialization: {e}, skipping merging")
+        if self.prunevid_stage1 is None:
+            # Stage 1未启用，直接返回
             return hidden_states, position_embeddings, position_ids
 
-        # 提取视觉 token 的位置
-        sample_input_ids = input_ids[0]
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        vision_start_token_id = self.config.vision_start_token_id
+        vision_end_token_id = self.config.vision_end_token_id
+
+        # 检测视觉token范围（假设batch内所有样本的vision token位置相同）
+        # 使用第一个样本来检测位置
+        sample_input_ids = input_ids[0].squeeze(0) if input_ids.dim() > 2 else input_ids[0]  # [seq_len]
         vision_start_indices = (sample_input_ids == vision_start_token_id).nonzero(as_tuple=True)[0]
         vision_end_indices = (sample_input_ids == vision_end_token_id).nonzero(as_tuple=True)[0]
 
-        visual_token_indices = []
-        for start_idx, end_idx in zip(vision_start_indices, vision_end_indices):
-            visual_token_indices.extend(range(start_idx + 1, end_idx))
-
-        if len(visual_token_indices) == 0:
-            if verbose:
-                print("[Stage 1] No visual tokens found")
+        if len(vision_start_indices) == 0 or len(vision_end_indices) == 0:
+            # 没有视觉tokens
             return hidden_states, position_embeddings, position_ids
 
-        # 提取数据
-        sample_hidden = hidden_states[0]  # [seq_len, hidden_dim]
-        sample_pos_ids = position_ids[:, 0]  # [3, seq_len]
-        sample_pos_emb1 = position_embeddings[0][:, 0]  # [3, seq_len, emb_dim]
-        sample_pos_emb2 = position_embeddings[1][:, 0]  # [3, seq_len, emb_dim]
+        visual_start = vision_start_indices[0].item() + 1
+        visual_end = vision_end_indices[0].item()
 
-        time_ids = sample_pos_ids[0, :]
-        height_ids = sample_pos_ids[1, :]
-        width_ids = sample_pos_ids[2, :]
-
-        # 构建视觉 token mask
-        visual_indices_set = set(visual_token_indices)
-        visual_mask = torch.tensor([i in visual_indices_set for i in range(seq_len)], device=device)
-
-        visual_hidden = sample_hidden[visual_mask]
-        visual_time_ids = time_ids[visual_mask]
-        visual_height_ids = height_ids[visual_mask]
-        visual_width_ids = width_ids[visual_mask]
-        visual_pos_emb1 = sample_pos_emb1[:, visual_mask]
-        visual_pos_emb2 = sample_pos_emb2[:, visual_mask]
-
-        # 按帧分组
-        unique_frames = visual_time_ids.unique().sort()[0]
-        T = len(unique_frames)
-
-        tokens_per_frame = []
-        time_ids_per_frame = []
-        height_ids_per_frame = []
-        width_ids_per_frame = []
-        pos_emb1_per_frame = []
-        pos_emb2_per_frame = []
-
-        for t in unique_frames:
-            frame_mask = (visual_time_ids == t)
-            tokens_per_frame.append(visual_hidden[frame_mask])
-            time_ids_per_frame.append(visual_time_ids[frame_mask])
-            height_ids_per_frame.append(visual_height_ids[frame_mask])
-            width_ids_per_frame.append(visual_width_ids[frame_mask])
-            pos_emb1_per_frame.append(visual_pos_emb1[:, frame_mask])
-            pos_emb2_per_frame.append(visual_pos_emb2[:, frame_mask])
-
-        # 检查每帧token数量是否相同
-        frame_sizes = [t.shape[0] for t in tokens_per_frame]
-        if len(set(frame_sizes)) != 1:
-            if verbose:
-                print(f"[Stage 1] Frame sizes not uniform: {frame_sizes}, skipping")
+        if visual_start >= visual_end:
             return hidden_states, position_embeddings, position_ids
 
-        N = frame_sizes[0]
-        frame_tokens = torch.stack(tokens_per_frame, dim=0)  # [T, N, C]
-        frame_time_ids = torch.stack(time_ids_per_frame, dim=0)
-        frame_height_ids = torch.stack(height_ids_per_frame, dim=0)
-        frame_width_ids = torch.stack(width_ids_per_frame, dim=0)
-        frame_pos_emb1 = torch.stack([p.permute(1, 0, 2) for p in pos_emb1_per_frame], dim=0)
-        frame_pos_emb2 = torch.stack([p.permute(1, 0, 2) for p in pos_emb2_per_frame], dim=0)
-
-        # 1. 时序聚类
-        frame_features = frame_tokens.mean(dim=1)  # [T, C]
-        num_clusters = max(1, int(T * temporal_segment_ratio))
-
-        if num_clusters >= T:
-            num_clusters = max(1, T // 2)
-
-        cluster_indices, _ = cluster_dpc_knn(
-            frame_features,
-            cluster_num=num_clusters,
-            k=min(dpc_knn_k, T - 1),
-            device=device,
+        # 调用Stage 1 - 传入完整的hidden_states和position信息（包含所有batch）
+        new_hidden_states, new_position_ids, new_position_embeddings, merge_stats = self.prunevid_stage1(
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+            visual_token_start=visual_start,
+            visual_token_end=visual_end,
         )
-        cluster_indices = enforce_temporal_continuity(cluster_indices)
 
-        segments = []
-        for cluster_id in range(num_clusters):
-            frame_ids = (cluster_indices == cluster_id).nonzero(as_tuple=True)[0].tolist()
-            if len(frame_ids) > 0:
-                segments.append(frame_ids)
+        # 保存统计信息
+        self.prunevid_stats['stage1'] = merge_stats
 
-        # 2. 对每个segment进行处理
-        all_merged_tokens = []
-        all_merged_time_ids = []
-        all_merged_height_ids = []
-        all_merged_width_ids = []
-        all_merged_pos_emb1 = []
-        all_merged_pos_emb2 = []
-
-        tokens_before = T * N
-        tokens_after = 0
-
-        for seg_id, frame_ids in enumerate(segments):
-            segment_tokens = frame_tokens[frame_ids]
-            segment_time_ids = frame_time_ids[frame_ids]
-            segment_height_ids = frame_height_ids[frame_ids]
-            segment_width_ids = frame_width_ids[frame_ids]
-            segment_pos_emb1 = frame_pos_emb1[frame_ids, :, 0, :]
-            segment_pos_emb2 = frame_pos_emb2[frame_ids, :, 0, :]
-
-            T_seg = len(frame_ids)
-
-            # 2.1 静态/动态分离
-            if T_seg <= 1:
-                static_mask = torch.zeros(N, dtype=torch.bool, device=device)
-            else:
-                similarity_scores = torch.zeros(N, device=device)
-                for i in range(N):
-                    token_seq = segment_tokens[:, i, :]
-                    token_seq_norm = F.normalize(token_seq, p=2, dim=1)
-                    sim_matrix = torch.mm(token_seq_norm, token_seq_norm.T)
-                    mask = torch.triu(torch.ones_like(sim_matrix), diagonal=1).bool()
-                    if mask.sum() > 0:
-                        similarity_scores[i] = sim_matrix[mask].mean()
-                static_mask = similarity_scores >= tau
-
-            dynamic_mask = ~static_mask
-
-            # 2.2 合并静态token
-            if static_mask.sum() > 0:
-                static_tokens = segment_tokens[:, static_mask, :]
-                merged_static = static_tokens.mean(dim=0)
-                static_time_ids = segment_time_ids[:, static_mask].float().mean(dim=0).long()
-                static_height_ids = segment_height_ids[:, static_mask].float().mean(dim=0).long()
-                static_width_ids = segment_width_ids[:, static_mask].float().mean(dim=0).long()
-                static_pos_emb1 = segment_pos_emb1[:, static_mask, :].mean(dim=0)
-                static_pos_emb2 = segment_pos_emb2[:, static_mask, :].mean(dim=0)
-            else:
-                emb_dim = segment_pos_emb1.shape[-1]
-                merged_static = torch.empty(0, hidden_dim, device=device)
-                static_time_ids = torch.empty(0, dtype=torch.long, device=device)
-                static_height_ids = torch.empty(0, dtype=torch.long, device=device)
-                static_width_ids = torch.empty(0, dtype=torch.long, device=device)
-                static_pos_emb1 = torch.empty(0, emb_dim, device=device)
-                static_pos_emb2 = torch.empty(0, emb_dim, device=device)
-
-            # 2.3 处理动态token（逐帧聚类）
-            merged_dynamic_list = []
-            dynamic_time_ids_list = []
-            dynamic_height_ids_list = []
-            dynamic_width_ids_list = []
-            dynamic_pos_emb1_list = []
-            dynamic_pos_emb2_list = []
-
-            for i in range(T_seg):
-                frame_dynamic_tokens = segment_tokens[i, dynamic_mask, :]
-                N_dynamic = frame_dynamic_tokens.shape[0]
-
-                if N_dynamic <= 1:
-                    merged_dynamic_list.append(frame_dynamic_tokens)
-                    dynamic_time_ids_list.append(segment_time_ids[i, dynamic_mask])
-                    dynamic_height_ids_list.append(segment_height_ids[i, dynamic_mask])
-                    dynamic_width_ids_list.append(segment_width_ids[i, dynamic_mask])
-                    dynamic_pos_emb1_list.append(segment_pos_emb1[i, dynamic_mask, :])
-                    dynamic_pos_emb2_list.append(segment_pos_emb2[i, dynamic_mask, :])
-                    continue
-
-                num_dynamic_clusters = max(1, int(N_dynamic * cluster_ratio))
-
-                if num_dynamic_clusters >= N_dynamic:
-                    merged_dynamic_list.append(frame_dynamic_tokens)
-                    dynamic_time_ids_list.append(segment_time_ids[i, dynamic_mask])
-                    dynamic_height_ids_list.append(segment_height_ids[i, dynamic_mask])
-                    dynamic_width_ids_list.append(segment_width_ids[i, dynamic_mask])
-                    dynamic_pos_emb1_list.append(segment_pos_emb1[i, dynamic_mask, :])
-                    dynamic_pos_emb2_list.append(segment_pos_emb2[i, dynamic_mask, :])
-                    continue
-
-                # 聚类
-                dyn_cluster_indices, _ = cluster_dpc_knn(
-                    frame_dynamic_tokens,
-                    cluster_num=num_dynamic_clusters,
-                    k=min(dpc_knn_k, N_dynamic - 1),
-                    device=device,
-                )
-
-                clustered_dynamic = merge_tokens_by_indices(
-                    frame_dynamic_tokens, dyn_cluster_indices, num_dynamic_clusters, method="mean"
-                )
-
-                # 合并位置信息
-                clustered_time_ids = torch.zeros(num_dynamic_clusters, dtype=torch.long, device=device)
-                clustered_height_ids = torch.zeros(num_dynamic_clusters, dtype=torch.long, device=device)
-                clustered_width_ids = torch.zeros(num_dynamic_clusters, dtype=torch.long, device=device)
-                emb_dim = segment_pos_emb1.shape[-1]
-                clustered_pos_emb1 = torch.zeros(num_dynamic_clusters, emb_dim, device=device)
-                clustered_pos_emb2 = torch.zeros(num_dynamic_clusters, emb_dim, device=device)
-
-                for c in range(num_dynamic_clusters):
-                    cluster_mask = (dyn_cluster_indices == c)
-                    if cluster_mask.sum() > 0:
-                        clustered_time_ids[c] = segment_time_ids[i, dynamic_mask][cluster_mask].float().mean().long()
-                        clustered_height_ids[c] = segment_height_ids[i, dynamic_mask][cluster_mask].float().mean().long()
-                        clustered_width_ids[c] = segment_width_ids[i, dynamic_mask][cluster_mask].float().mean().long()
-                        clustered_pos_emb1[c] = segment_pos_emb1[i, dynamic_mask, :][cluster_mask].mean(dim=0)
-                        clustered_pos_emb2[c] = segment_pos_emb2[i, dynamic_mask, :][cluster_mask].mean(dim=0)
-
-                merged_dynamic_list.append(clustered_dynamic)
-                dynamic_time_ids_list.append(clustered_time_ids)
-                dynamic_height_ids_list.append(clustered_height_ids)
-                dynamic_width_ids_list.append(clustered_width_ids)
-                dynamic_pos_emb1_list.append(clustered_pos_emb1)
-                dynamic_pos_emb2_list.append(clustered_pos_emb2)
-
-            # 拼接动态token
-            if len(merged_dynamic_list) > 0:
-                merged_dynamic = torch.cat(merged_dynamic_list, dim=0)
-                dynamic_time_ids = torch.cat(dynamic_time_ids_list, dim=0)
-                dynamic_height_ids = torch.cat(dynamic_height_ids_list, dim=0)
-                dynamic_width_ids = torch.cat(dynamic_width_ids_list, dim=0)
-                dynamic_pos_emb1 = torch.cat(dynamic_pos_emb1_list, dim=0)
-                dynamic_pos_emb2 = torch.cat(dynamic_pos_emb2_list, dim=0)
-            else:
-                emb_dim = segment_pos_emb1.shape[-1]
-                merged_dynamic = torch.empty(0, hidden_dim, device=device)
-                dynamic_time_ids = torch.empty(0, dtype=torch.long, device=device)
-                dynamic_height_ids = torch.empty(0, dtype=torch.long, device=device)
-                dynamic_width_ids = torch.empty(0, dtype=torch.long, device=device)
-                dynamic_pos_emb1 = torch.empty(0, emb_dim, device=device)
-                dynamic_pos_emb2 = torch.empty(0, emb_dim, device=device)
-
-            # 2.4 拼接静态和动态token
-            if merged_static.shape[0] > 0 and merged_dynamic.shape[0] > 0:
-                segment_merged_tokens = torch.cat([merged_static, merged_dynamic], dim=0)
-                segment_merged_time_ids = torch.cat([static_time_ids, dynamic_time_ids], dim=0)
-                segment_merged_height_ids = torch.cat([static_height_ids, dynamic_height_ids], dim=0)
-                segment_merged_width_ids = torch.cat([static_width_ids, dynamic_width_ids], dim=0)
-                segment_merged_pos_emb1 = torch.cat([static_pos_emb1, dynamic_pos_emb1], dim=0)
-                segment_merged_pos_emb2 = torch.cat([static_pos_emb2, dynamic_pos_emb2], dim=0)
-            elif merged_static.shape[0] > 0:
-                segment_merged_tokens = merged_static
-                segment_merged_time_ids = static_time_ids
-                segment_merged_height_ids = static_height_ids
-                segment_merged_width_ids = static_width_ids
-                segment_merged_pos_emb1 = static_pos_emb1
-                segment_merged_pos_emb2 = static_pos_emb2
-            else:
-                segment_merged_tokens = merged_dynamic
-                segment_merged_time_ids = dynamic_time_ids
-                segment_merged_height_ids = dynamic_height_ids
-                segment_merged_width_ids = dynamic_width_ids
-                segment_merged_pos_emb1 = dynamic_pos_emb1
-                segment_merged_pos_emb2 = dynamic_pos_emb2
-
-            all_merged_tokens.append(segment_merged_tokens)
-            all_merged_time_ids.append(segment_merged_time_ids)
-            all_merged_height_ids.append(segment_merged_height_ids)
-            all_merged_width_ids.append(segment_merged_width_ids)
-            all_merged_pos_emb1.append(segment_merged_pos_emb1)
-            all_merged_pos_emb2.append(segment_merged_pos_emb2)
-
-            tokens_after += segment_merged_tokens.shape[0]
-
-        # 3. 拼接所有segment
-        merged_visual_tokens = torch.cat(all_merged_tokens, dim=0)
-        merged_visual_time_ids = torch.cat(all_merged_time_ids, dim=0)
-        merged_visual_height_ids = torch.cat(all_merged_height_ids, dim=0)
-        merged_visual_width_ids = torch.cat(all_merged_width_ids, dim=0)
-        merged_visual_pos_emb1 = torch.cat(all_merged_pos_emb1, dim=0)
-        merged_visual_pos_emb2 = torch.cat(all_merged_pos_emb2, dim=0)
-
-        # 4. 重建完整的序列
-        non_visual_mask = ~visual_mask
-        non_visual_hidden = sample_hidden[non_visual_mask]
-        non_visual_time_ids = time_ids[non_visual_mask]
-        non_visual_height_ids = height_ids[non_visual_mask]
-        non_visual_width_ids = width_ids[non_visual_mask]
-        non_visual_pos_emb1 = sample_pos_emb1[:, non_visual_mask]
-        non_visual_pos_emb2 = sample_pos_emb2[:, non_visual_mask]
-
-        new_hidden = torch.cat([merged_visual_tokens, non_visual_hidden], dim=0)
-        new_time_ids = torch.cat([merged_visual_time_ids, non_visual_time_ids], dim=0)
-        new_height_ids = torch.cat([merged_visual_height_ids, non_visual_height_ids], dim=0)
-        new_width_ids = torch.cat([merged_visual_width_ids, non_visual_width_ids], dim=0)
-        new_pos_emb1 = torch.cat([merged_visual_pos_emb1, non_visual_pos_emb1.permute(1, 0, 2)[:, 0, :]], dim=0)
-        new_pos_emb2 = torch.cat([merged_visual_pos_emb2, non_visual_pos_emb2.permute(1, 0, 2)[:, 0, :]], dim=0)
-
-        # 5. 重建batch格式
-        new_hidden_states = new_hidden.unsqueeze(0)
-        new_position_ids = torch.stack([new_time_ids, new_height_ids, new_width_ids], dim=0).unsqueeze(1)
-        new_pos_emb1_full = new_pos_emb1.unsqueeze(0).unsqueeze(0).expand(3, 1, -1, -1)
-        new_pos_emb2_full = new_pos_emb2.unsqueeze(0).unsqueeze(0).expand(3, 1, -1, -1)
-        new_position_embeddings = (new_pos_emb1_full, new_pos_emb2_full)
-
-        if verbose:
-            reduction_ratio = tokens_after / tokens_before if tokens_before > 0 else 1.0
-            print(f"[Stage 1] Tokens: {tokens_before} -> {tokens_after} ({(1-reduction_ratio)*100:.1f}% reduction)")
+        if self.prunevid_config.verbose:
+            new_seq_len = new_hidden_states.shape[1]
+            print(f"[PruneVid Stage 1] tokens: {seq_len} -> {new_seq_len}, "
+                  f"reduction: {(seq_len - new_seq_len) / seq_len * 100:.1f}%")
 
         return new_hidden_states, new_position_embeddings, new_position_ids
 
+    def apply_stage2(
+        self,
+        hidden_states: torch.Tensor,
+        attn_weights: torch.Tensor,
+        position_ids: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        visual_token_start: int,
+        visual_token_end: int,
+    ):
+        """
+        PruneVid Stage 2: 基于注意力的Token选择
 
+        Args:
+            hidden_states: [batch, seq_len, hidden_dim]
+            attn_weights: [batch, num_heads, seq_len, seq_len]
+            position_ids: [3, batch, seq_len]
+            position_embeddings: (cos, sin)
+            attention_mask: causal mask
+            visual_token_start: 视觉token起始位置
+            visual_token_end: 视觉token结束位置
+
+        Returns:
+            updated tensors and stats
+        """
+        # 使用stage2选择器分析attention并选择token
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+
+        # 提取交叉注意力：文本token → 视觉token
+        # 文本token在视觉token之前
+        text_token_end = visual_token_start
+        text_token_start = 0
+
+        if text_token_end <= text_token_start:
+            # 没有文本token，跳过Stage 2
+            return hidden_states, position_ids, position_embeddings, attention_mask, {}
+
+        # [batch, num_heads, num_text, num_visual]
+        cross_attention = attn_weights[:, :, text_token_start:text_token_end, visual_token_start:visual_token_end]
+
+        # 计算每个视觉token的重要性分数
+        num_visual = cross_attention.shape[3]
+
+        if self.prunevid_config.attention_aggregation == "max":
+            # Max over 文本token维度
+            max_over_text = cross_attention.max(dim=2)[0]  # [batch, num_heads, num_visual]
+            # Max over attention heads
+            importance_scores = max_over_text.max(dim=1)[0]  # [batch, num_visual]
+        else:  # mean
+            mean_over_text = cross_attention.mean(dim=2)
+            importance_scores = mean_over_text.mean(dim=1)
+
+        # 选择top-k (支持batch处理)
+        num_to_keep = max(1, int(num_visual * self.prunevid_config.keep_ratio))
+
+        # 处理每个batch样本
+        selected_indices_list = []
+        for b in range(batch_size):
+            scores_b = importance_scores[b]  # [num_visual]
+            _, top_k_indices = torch.topk(scores_b, num_to_keep, largest=True)
+            # 转换为全局索引并排序
+            global_indices = top_k_indices + visual_token_start
+            global_indices_sorted, _ = torch.sort(global_indices)
+            selected_indices_list.append(global_indices_sorted)
+
+        # 假设所有batch选择的位置相同（通常情况）
+        selected_indices = selected_indices_list[0]
+
+        if self.prunevid_config.verbose:
+            print(f"[Stage 2] 选择 {num_to_keep}/{num_visual} 视觉tokens ({self.prunevid_config.keep_ratio*100:.1f}%)")
+
+        # 重新组织序列：[文本前] + [选中的视觉] + [文本后]
+        text_before_indices = torch.arange(0, visual_token_start, device=hidden_states.device)
+
+        # 检查是否有文本tokens在视觉tokens之后
+        if visual_token_end < seq_len:
+            text_after_indices = torch.arange(visual_token_end, seq_len, device=hidden_states.device)
+            all_indices = torch.cat([text_before_indices, selected_indices, text_after_indices])
+        else:
+            # 没有文本tokens在视觉tokens之后
+            all_indices = torch.cat([text_before_indices, selected_indices])
+
+        # 更新hidden_states
+        new_hidden_states = hidden_states[:, all_indices, :]
+
+        # 更新position_ids
+        new_position_ids = position_ids[:, :, all_indices]
+
+        # 更新position_embeddings
+        cos, sin = position_embeddings
+        new_cos = cos[:, :, all_indices, :]
+        new_sin = sin[:, :, all_indices, :]
+        new_position_embeddings = (new_cos, new_sin)
+
+        # 更新attention_mask
+        new_attention_mask = None
+        if attention_mask is not None:
+            # attention_mask shape可能是[batch, 1, seq_len, seq_len]或其他
+            if attention_mask.dim() == 4:
+                new_attention_mask = attention_mask[:, :, all_indices, :][:, :, :, all_indices]
+            else:
+                new_attention_mask = attention_mask
+
+        # 统计信息
+        from utils import compute_compression_stats
+        stats = compute_compression_stats(num_visual, num_to_keep)
+        stats['num_text_before'] = visual_token_start
+        stats['num_text_after'] = seq_len - visual_token_end
+
+        return new_hidden_states, new_position_ids, new_position_embeddings, new_attention_mask, stats
+
+    def token_drop(
+        self,
+        method: str,
+        threshold: float,
+        absolute: bool = True,
+        hidden_states: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        dr_save_path: Optional[str] = None,
+        dp_save_path: Optional[str] = None,
+    ):
+        """
+        Perform token dropping within visual tokens, grouped by frame (Time dimension),
+        while skipping tokens in a specified row or column.
+
+        Args:
+            method (str):
+                The method to use for token dropping. Either "pixel" or "feature".
+            threshold (float):
+                The threshold for dropping tokens.
+                - If `absolute` is True:
+                    - For "pixel" method, it is the rescaled average RGB difference threshold, from 0 to 1.
+                    - For "feature" method, it is the cosine similarity threshold, from -1 to 1.
+                - If `absolute` is False:
+                    - It is the percentage of tokens to drop.
+            absolute (bool):
+                Whether the threshold is absolute or relative.
+            hidden_states (torch.Tensor): 
+                Shape [batch_size, seq_len, hidden_dim].
+            pixel_values_videos (torch.Tensor):
+                Shape [
+                    grid_t * (grid_h // merge_size) * (grid_w // merge_size) * merge_size * merge_size,
+                    channel * temporal_patch_size * patch_size * patch_size
+                ].
+            video_grid_thw (torch.LongTensor):
+                [grid_t, grid_h, grid_w].
+            position_embeddings (Tuple[torch.Tensor, torch.Tensor]): 
+                A tuple of two tensors:
+                (
+                pos_emb1: [3, batch_size, seq_len, emb_dim],
+                pos_emb2: [3, batch_size, seq_len, emb_dim]
+                ), where the first dimension (size=3) corresponds to
+                (time, height, width) channels.
+            position_ids (torch.Tensor):
+                Shape [3, batch_size, seq_len], each channel is (time, height, width).
+            input_ids (torch.Tensor):
+                Shape [batch_size, 1, seq_len] (assumed). 
+
+        Returns:
+            (torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor):
+                A tuple of:
+                    dropped_hidden_states:      [batch_size, new_seq_len, hidden_dim]
+                    dropped_position_embeddings: (
+                        [3, batch_size, new_seq_len, emb_dim],
+                        [3, batch_size, new_seq_len, emb_dim]
+                    )
+                    dropped_position_ids:       [3, batch_size, new_seq_len]
+        """
+        if absolute == None:
+            absolute = True
+        arg_check = ""
+        if method not in ['pixel', 'feature']:
+            arg_check += f" Method {method} is not supported for token dropping."
+        if not absolute and (threshold < 0.0 or threshold > 1.0):
+            arg_check += f" Threshold value {threshold} is not within [0, 1] range for relative thresholding."
+        if absolute and method == 'pixel' and (threshold < 0.0 or threshold > 1.0):
+            arg_check += f" Threshold value {threshold} is not within [0, 1] range for pixel thresholding."
+        if absolute and method == 'feature' and (threshold < -1.0 or threshold > 1.0):
+            arg_check += f" Threshold value {threshold} is not within [-1, 1] range for feature thresholding."
+        if arg_check:
+            raise ValueError(arg_check)
+        
+        batch_size, seq_len, _ = hidden_states.size()
+        grid_t, grid_h, grid_w = video_grid_thw[0]
+        merge_size = 2  # hard-coded for now
+        channel = 3
+        temporal_patch_size = 2
+        patch_size = 14
+        pixel_values_videos = pixel_values_videos.view(
+            grid_t, 
+            grid_h // merge_size, 
+            grid_w // merge_size, 
+            merge_size, 
+            merge_size, 
+            channel, 
+            temporal_patch_size, 
+            patch_size, 
+            patch_size
+        )
+        pixel_values_videos = pixel_values_videos.permute(0, 6, 1, 2, 5, 3, 4, 7, 8)
+        pixel_values_videos = pixel_values_videos.reshape(
+            grid_t, 
+            temporal_patch_size, 
+            (grid_h // merge_size) * (grid_w // merge_size), 
+            channel,
+            -1
+        )
+        # Denormalize pixel_values_videos to [0, 1]
+        for channel_id in range(3):
+            pixel_values_videos[:, :, :, channel_id] = pixel_values_videos[:, :, :, channel_id] * OPENAI_CLIP_STD[channel_id] + OPENAI_CLIP_MEAN[channel_id]
+
+        vision_start_token_id = self.config.vision_start_token_id
+        vision_end_token_id   = self.config.vision_end_token_id
+
+        dropped_hidden_states_list  = []
+        dropped_pos_emb1_list       = []
+        dropped_pos_emb2_list       = []
+        dropped_pos_ids_list        = []
+        
+        dropped_positions_info = []
+        cnt_total, cnt_drop = 0, 0
+        
+        for i in range(batch_size):
+            sample_input_ids = input_ids[i].squeeze(0)  # from [1, seq_len] to [seq_len]
+
+            vision_start_indices = (sample_input_ids == vision_start_token_id).nonzero(as_tuple=True)[0]
+            vision_end_indices   = (sample_input_ids == vision_end_token_id).nonzero(as_tuple=True)[0]
+
+            visual_token_indices = []
+            for start_idx, end_idx in zip(vision_start_indices, vision_end_indices):
+                visual_token_indices.extend(range(start_idx + 1, end_idx)) # Assuming start_idx < end_idx
+            visual_token_indices = set(visual_token_indices)
+
+            sample_pos_ids = position_ids[:, i] # [3, seq_len]
+            time_ids   = sample_pos_ids[0, :]   # channel 0 => time
+            height_ids = sample_pos_ids[1, :]  # channel 1 => row
+            width_ids  = sample_pos_ids[2, :]  # channel 2 => column
+            unique_frames = time_ids.unique()
+
+            keep_mask = torch.ones(seq_len, dtype=torch.bool, device=hidden_states.device)
+            drop_pos = {}
+            
+            if len(visual_token_indices) > 0:
+                if method == 'pixel':
+                    curr_frame, prev_frame = None, None
+                    idx_this_frame = -1
+                    for t in unique_frames:
+                        frame_indices = (time_ids == t).nonzero(as_tuple=True)[0]
+                        frame_indices = [idx for idx in frame_indices if idx.item() in visual_token_indices]
+
+                        if len(frame_indices) == 0:
+                            continue
+                        idx_this_frame += 1
+                        
+                        start_idx = frame_indices[0]
+                        h_start, w_start = height_ids[start_idx].item(), width_ids[start_idx].item()
+                        curr_frame = pixel_values_videos[idx_this_frame, -1] # [num_patches, channel, other_dims]
+                        cnt_total += len(frame_indices)
+                        if prev_frame is None:
+                            prev_frame = pixel_values_videos[idx_this_frame, 0]
+                            continue
+                        
+                        difference = torch.abs(prev_frame - curr_frame).mean(dim=2).mean(dim=1) # [num_patches]
+                        
+                        if absolute:
+                            drop_indices_this_frame = (difference < threshold).nonzero(as_tuple=True)[0].to(start_idx.device) + start_idx
+                        else:
+                            k = int(difference.numel() * threshold)
+                            drop_indices_this_frame = torch.topk(difference, k, largest=False).indices.to(start_idx.device) + start_idx  # out-of-order
+                        
+                        cnt_drop += len(drop_indices_this_frame)
+                        prev_frame = pixel_values_videos[idx_this_frame, 0]
+                        
+                        keep_mask[drop_indices_this_frame] = False
+                        
+                        # save drop token idx
+                        for di in drop_indices_this_frame:
+                            h_ = height_ids[di].item() - h_start
+                            w_ = width_ids[di].item() - w_start
+                            if idx_this_frame not in drop_pos:
+                                drop_pos[idx_this_frame] = []
+                            drop_pos[idx_this_frame].append((h_, w_))
+                    
+                if method == 'feature':
+                    curr_frame, prev_frame = None, None
+                    idx_this_frame = -1
+                    for t in unique_frames:
+                        frame_indices = (time_ids == t).nonzero(as_tuple=True)[0]
+                        frame_indices = [idx for idx in frame_indices if idx.item() in visual_token_indices]
+
+                        if len(frame_indices) == 0:
+                            continue
+                        idx_this_frame += 1
+                        
+                        start_idx = frame_indices[0]
+                        h_start, w_start = height_ids[start_idx].item(), width_ids[start_idx].item()
+                        curr_frame = hidden_states[i, frame_indices] # [num_patches, hidden_dim]
+                        cnt_total += len(frame_indices)
+                        if prev_frame is None:
+                            prev_frame = curr_frame
+                            continue
+                        similarity = F.cosine_similarity(prev_frame, curr_frame, dim=1) # [num_patches]
+                        
+                        if absolute:
+                            drop_indices_this_frame = (similarity > threshold).nonzero(as_tuple=True)[0].to(start_idx.device) + start_idx
+                        else:
+                            k = int(similarity.numel() * threshold)
+                            drop_indices_this_frame = torch.topk(similarity, k).indices.to(start_idx.device) + start_idx    # out-of-order
+                        
+                        cnt_drop += len(drop_indices_this_frame)
+                        prev_frame = curr_frame
+                        
+                        keep_mask[drop_indices_this_frame] = False
+                        
+                        # save drop token idx
+                        for di in drop_indices_this_frame:
+                            h_ = height_ids[di].item() - h_start
+                            w_ = width_ids[di].item() - w_start
+                            if idx_this_frame not in drop_pos:
+                                drop_pos[idx_this_frame] = []
+                            drop_pos[idx_this_frame].append((h_, w_))
+
+            dropped_positions_info.append(drop_pos)
+            
+            # Apply keep_mask to hidden_states
+            dropped_hidden = hidden_states[i][keep_mask.to(hidden_states.device)]
+
+            # Apply keep_mask to position_embeddings
+            # pos_emb1/pos_emb2 => [3, batch_size, seq_len, emb_dim]
+            pos_emb1_i = position_embeddings[0][:, i]  # shape [3, seq_len, emb_dim]
+            pos_emb2_i = position_embeddings[1][:, i]  # same shape
+
+            # Transform [3, seq_len, emb_dim] to [seq_len, 3, emb_dim], filter, then revert
+            dropped_pos_emb1 = pos_emb1_i.transpose(0,1)[keep_mask.to(pos_emb1_i.device)].transpose(0,1)
+            dropped_pos_emb2 = pos_emb2_i.transpose(0,1)[keep_mask.to(pos_emb2_i.device)].transpose(0,1)
+
+            # Apply keep_mask to position_ids => shape [3, seq_len] => [seq_len, 3]
+            pos_ids_i = sample_pos_ids.transpose(0,1)
+            dropped_pos_ids_i = pos_ids_i[keep_mask.to(pos_ids_i.device)].transpose(0,1)  # shape [3, new_seq_len]
+
+            # Collect the results of this sample
+            dropped_hidden_states_list.append(dropped_hidden.unsqueeze(0))         # [1, new_seq_len, hidden_dim]
+            dropped_pos_emb1_list.append(dropped_pos_emb1.unsqueeze(1))           # [3, 1, new_seq_len, emb_dim]
+            dropped_pos_emb2_list.append(dropped_pos_emb2.unsqueeze(1))           # [3, 1, new_seq_len, emb_dim]
+            dropped_pos_ids_list.append(dropped_pos_ids_i.unsqueeze(1))           # [3, 1, new_seq_len]
+
+        # Finally, concatenate all samples
+        # If different samples end up with different new_seq_len, torch.cat will fail.
+        dropped_hidden_states = torch.cat(dropped_hidden_states_list, dim=0)
+        dropped_pos_emb1 = torch.cat(dropped_pos_emb1_list, dim=1)
+        dropped_pos_emb2 = torch.cat(dropped_pos_emb2_list, dim=1)
+        dropped_pos_ids  = torch.cat(dropped_pos_ids_list,  dim=1)
+
+        dropped_position_embeddings = (dropped_pos_emb1, dropped_pos_emb2)
+        
+        # save drop ratio info
+        if dr_save_path:
+            drop_ratio_info = {
+                'drop': cnt_drop,
+                'total': cnt_total,
+                'ratio': cnt_drop / cnt_total
+            }
+            with open(dr_save_path, 'a' if os.path.exists(dr_save_path) else 'w') as f:
+                f.write(json.dumps(drop_ratio_info) + '\n')
+        
+        # save drop positions info
+        if dp_save_path:
+            with open(dp_save_path, 'a' if os.path.exists(dr_save_path) else 'w') as f:
+                f.write(json.dumps(dropped_positions_info) + '\n')
+
+        return dropped_hidden_states, dropped_position_embeddings, dropped_pos_ids
 
     def forward(
         self,
@@ -1644,13 +1610,11 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         pixel_values_videos: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
-        # PruneVid Stage 1 parameters
-        tau: Optional[float] = 0.8,
-        cluster_ratio: Optional[float] = 0.5,
-        temporal_segment_ratio: Optional[float] = 0.25,
-        dpc_knn_k: Optional[int] = 5,
-        enable_stage1: Optional[bool] = False,
-        verbose: Optional[bool] = False,
+        drop_method: Optional[str] = None,
+        drop_threshold: Optional[float] = None,
+        drop_absolute: Optional[bool] = None,
+        dr_save_path: Optional[str] = None,
+        dp_save_path: Optional[str] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1698,41 +1662,32 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         
-        # PruneVid Stage 1: Spatial-Temporal Token Merging
-        vision_start_token_id = self.config.vision_start_token_id
-        if enable_stage1 and vision_start_token_id in input_ids[0] and video_grid_thw is not None:
-            original_seq_len = hidden_states.shape[1]
-
-            hidden_states, position_embeddings, position_ids = self.spatial_temporal_token_merge(
-                tau=tau,
-                cluster_ratio=cluster_ratio,
-                temporal_segment_ratio=temporal_segment_ratio,
-                dpc_knn_k=dpc_knn_k,
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                position_ids=position_ids,
-                input_ids=input_ids,
-                video_grid_thw=video_grid_thw,
-                verbose=verbose,
-            )
-
-            new_seq_len = hidden_states.shape[1]
-
-            # 如果序列长度改变了，需要重新计算 causal_mask 和 cache_position
-            if new_seq_len != original_seq_len:
-                if verbose:
-                    print(f"[Stage 1] Sequence length changed: {original_seq_len} -> {new_seq_len}")
-
-                # 更新 cache_position
-                if cache_position is not None:
-                    # 简单截断或扩展 cache_position
-                    if new_seq_len < original_seq_len:
-                        cache_position = cache_position[:new_seq_len]
-                    # 注意：这里假设 past_key_values 为 None（第一次推理）
-
-                # 重新计算 causal_mask
-                causal_mask = self._update_causal_mask(
-                    attention_mask, hidden_states, cache_position, past_key_values, output_attentions
+        # PruneVid Stage 1: 时空Token合并（优先使用，如果启用）
+        if self.prunevid_stage1 is not None:
+            vision_start_token_id = self.config.vision_start_token_id
+            if vision_start_token_id in input_ids[0]:
+                hidden_states, position_embeddings, position_ids = self.prunevid_merge(
+                    hidden_states=hidden_states,
+                    position_embeddings=position_embeddings,
+                    position_ids=position_ids,
+                    input_ids=input_ids,
+                )
+        # DTD token drop (如果PruneVid未启用且DTD参数提供)
+        elif drop_method is not None and drop_method.lower() != 'none':
+            vision_start_token_id = self.config.vision_start_token_id
+            if vision_start_token_id in input_ids[0]:
+                hidden_states, position_embeddings, position_ids = self.token_drop(
+                    method=drop_method,
+                    threshold=drop_threshold,
+                    absolute=drop_absolute,
+                    hidden_states=hidden_states,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                    position_embeddings=position_embeddings,
+                    position_ids=position_ids,
+                    input_ids=input_ids,
+                    dr_save_path=dr_save_path,
+                    dp_save_path=dp_save_path,
                 )
 
         # decoder layers
@@ -1740,9 +1695,36 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        # Stage 2: 跟踪是否需要在pruning_layer提取attention
+        stage2_should_extract = (
+            self.prunevid_stage2 is not None and
+            input_ids is not None and
+            self.config.vision_start_token_id in input_ids[0]
+        )
+        stage2_applied = False
+
+        # 如果启用了Stage 1，记录原始序列长度和视觉token后的文本长度
+        # 这些信息在Stage 2中需要用来计算新的视觉token位置
+        original_seq_len = None
+        original_text_after_len = None
+        if self.prunevid_stage1 is not None and input_ids is not None:
+            original_seq_len = hidden_states.shape[1]
+            vision_start_token_id = self.config.vision_start_token_id
+            vision_end_token_id = self.config.vision_end_token_id
+            sample_input_ids = input_ids[0].squeeze(0) if input_ids.dim() > 2 else input_ids[0]
+            vision_end_indices = (sample_input_ids == vision_end_token_id).nonzero(as_tuple=True)[0]
+            if len(vision_end_indices) > 0:
+                original_visual_end = vision_end_indices[0].item()
+                original_text_after_len = original_seq_len - original_visual_end
+
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            # Stage 2: 如果到达pruning_layer，需要提取attention
+            layer_output_attentions = output_attentions
+            if stage2_should_extract and layer_idx == self.prunevid_config.pruning_layer:
+                layer_output_attentions = True  # 强制输出attention
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -1751,7 +1733,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     causal_mask,
                     position_ids,
                     past_key_values,
-                    output_attentions,
+                    layer_output_attentions,
                     use_cache,
                     cache_position,
                     position_embeddings,
@@ -1762,7 +1744,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
-                    output_attentions=output_attentions,
+                    output_attentions=layer_output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
@@ -1771,10 +1753,54 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                next_decoder_cache = layer_outputs[2 if layer_output_attentions else 1]
 
+            # 只在用户真正要求output_attentions时才添加
+            # Stage 2可能会在单个层强制输出attention，但不应添加到all_self_attns
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+
+            # Stage 2: 在pruning_layer之后应用token selection
+            if stage2_should_extract and layer_idx == self.prunevid_config.pruning_layer and not stage2_applied:
+                # 提取attention weights
+                attn_weights = layer_outputs[1]  # [batch, num_heads, seq_len, seq_len]
+
+                # 找到视觉token的位置
+                # 注意：如果Stage 1已经执行，视觉token的位置会改变
+                vision_start_token_id = self.config.vision_start_token_id
+                sample_input_ids = input_ids[0].squeeze(0) if input_ids.dim() > 2 else input_ids[0]
+                vision_start_indices = (sample_input_ids == vision_start_token_id).nonzero(as_tuple=True)[0]
+
+                if len(vision_start_indices) > 0:
+                    visual_start = vision_start_indices[0].item() + 1
+
+                    # 计算visual_end：如果Stage 1执行了，需要基于当前seq_len计算
+                    current_seq_len = hidden_states.shape[1]
+                    if original_text_after_len is not None:
+                        # Stage 1已执行，使用新的位置
+                        visual_end = current_seq_len - original_text_after_len
+                    else:
+                        # Stage 1未执行，使用原始位置
+                        vision_end_token_id = self.config.vision_end_token_id
+                        vision_end_indices = (sample_input_ids == vision_end_token_id).nonzero(as_tuple=True)[0]
+                        if len(vision_end_indices) > 0:
+                            visual_end = vision_end_indices[0].item()
+                        else:
+                            visual_end = visual_start  # 没有视觉token
+
+                    if visual_end > visual_start:
+                        # 应用Stage 2
+                        hidden_states, position_ids, position_embeddings, causal_mask, stage2_stats = self.apply_stage2(
+                            hidden_states=hidden_states,
+                            attn_weights=attn_weights,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                            attention_mask=causal_mask,
+                            visual_token_start=visual_start,
+                            visual_token_end=visual_end,
+                        )
+                        self.prunevid_stats['stage2'] = stage2_stats
+                        stage2_applied = True
 
         hidden_states = self.norm(hidden_states)
 
@@ -2066,13 +2092,16 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
     config_class = Qwen2_5_VLConfig
     _no_split_modules = ["Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"]
 
-    def __init__(self, config):
+    def __init__(self, config, prunevid_config=None):
         super().__init__(config)
         self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
-        self.model = Qwen2_5_VLModel(config)
+        self.model = Qwen2_5_VLModel(config, prunevid_config=prunevid_config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.rope_deltas = None  # cache rope_deltas here
+
+        # PruneVid配置
+        self.prunevid_config = prunevid_config
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -2094,6 +2123,12 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
     def get_decoder(self):
         return self.model
+
+    def get_stats(self):
+        """获取PruneVid的统计信息"""
+        if hasattr(self.model, 'prunevid_stats'):
+            return self.model.prunevid_stats
+        return {}
 
     def get_rope_index(
         self,
@@ -2226,9 +2261,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     text_len = ed - st
 
                     st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                    llm_pos_ids_list.append(torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx)
 
-                    range_tensor = torch.arange(llm_grid_t).view(-1, 1)
+                    range_tensor = torch.arange(llm_grid_t, device=input_ids.device).view(-1, 1)
                     expanded_range = range_tensor.expand(-1, llm_grid_h * llm_grid_w)
 
                     time_tensor = expanded_range * second_per_grid_t * self.config.vision_config.tokens_per_second
@@ -2236,15 +2271,15 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     time_tensor_long = time_tensor.long()
                     t_index = time_tensor_long.flatten()
 
-                    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
-                    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                    h_index = torch.arange(llm_grid_h, device=input_ids.device).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                    w_index = torch.arange(llm_grid_w, device=input_ids.device).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
                     llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
                     st = ed + llm_grid_t * llm_grid_h * llm_grid_w
 
                 if st < len(input_tokens):
                     st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                     text_len = len(input_tokens) - st
-                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                    llm_pos_ids_list.append(torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx)
 
                 llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
                 position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
@@ -2293,13 +2328,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
-        # PruneVid Stage 1 parameters
-        tau: Optional[float] = 0.8,
-        cluster_ratio: Optional[float] = 0.5,
-        temporal_segment_ratio: Optional[float] = 0.25,
-        dpc_knn_k: Optional[int] = 5,
-        enable_stage1: Optional[bool] = False,
-        verbose: Optional[bool] = False,
+        drop_method: Optional[str] = None,
+        drop_threshold: Optional[float] = None,
+        drop_absolute: Optional[bool] = None,
+        dr_save_path: Optional[str] = None,
+        dp_save_path: Optional[str] = None,
     ):# -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2434,13 +2467,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
-            # PruneVid Stage 1 parameters
-            tau=tau,
-            cluster_ratio=cluster_ratio,
-            temporal_segment_ratio=temporal_segment_ratio,
-            dpc_knn_k=dpc_knn_k,
-            enable_stage1=enable_stage1,
-            verbose=verbose,
+            drop_method=drop_method,
+            drop_threshold=drop_threshold,
+            drop_absolute=drop_absolute,
+            dr_save_path=dr_save_path,
+            dp_save_path=dp_save_path,
         )
 
         hidden_states = outputs[0]
@@ -2488,13 +2519,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         image_grid_thw=None,
         video_grid_thw=None,
         second_per_grid_ts=None,
-        # PruneVid Stage 1 parameters
-        tau=0.8,
-        cluster_ratio=0.5,
-        temporal_segment_ratio=0.25,
-        dpc_knn_k=5,
-        enable_stage1=False,
-        verbose=False,
+        drop_method=None,
+        drop_threshold=None,
+        drop_absolute=None,
+        dr_save_path=None,
+        dp_save_path=None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -2559,13 +2588,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 "video_grid_thw": video_grid_thw,
                 "cache_position": cache_position,
                 "second_per_grid_ts": second_per_grid_ts,
-                # PruneVid Stage 1 parameters
-                "tau": tau,
-                "cluster_ratio": cluster_ratio,
-                "temporal_segment_ratio": temporal_segment_ratio,
-                "dpc_knn_k": dpc_knn_k,
-                "enable_stage1": enable_stage1,
-                "verbose": verbose,
+                "drop_method": drop_method,
+                "drop_threshold": drop_threshold,
+                "drop_absolute": drop_absolute,
+                "dr_save_path": dr_save_path,
+                "dp_save_path": dp_save_path,
             }
         )
         return model_inputs

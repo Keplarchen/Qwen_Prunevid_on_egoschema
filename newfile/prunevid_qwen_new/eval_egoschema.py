@@ -1,5 +1,5 @@
 """
-EgoSchema评估脚本 - PruneVid for Qwen2.5-VL
+EgoSchema评估脚本 - PruneVid for Qwen2.5-VL (新实现)
 
 在EgoSchema数据集上评估PruneVid方法的性能和token压缩效果
 """
@@ -28,29 +28,30 @@ DATASET_NAME = "lmms-lab/egoschema"
 DATASET_SPLIT = "test"  # 'test' or 'validation'
 
 # 模型配置
-MODEL_PATH = "/mnt/ssd_ext/huggingface/models/Qwen2.5-VL-7B-Instruct"  # Qwen2.5-VL模型路径
+MODEL_PATH = "Qwen/Qwen2.5-VL-7B-Instruct"  # Qwen2.5-VL模型路径（可以是HF ID或本地路径）
 
+# PruneVid配置模式
+CONFIG_MODE = "paper"  # 可选: "baseline", "paper", "conservative", "aggressive", "custom"
+
+# 自定义配置（仅当CONFIG_MODE="custom"时使用）
 # Stage 1: 时空Token合并
-ENABLE_STAGE1 = True
-TAU = 0.8  # 静态/动态分离阈值 (0.6-0.9)
-CLUSTER_RATIO = 0.5  # 空间聚类保留比例 (0.3-0.7)
-TEMPORAL_SEGMENT_RATIO = 0.25  # 时序分段比例 (0.125-0.5)
-DPC_KNN_K = 5  # DPC-KNN的k近邻参数
+CUSTOM_ENABLE_STAGE1 = True
+CUSTOM_TAU = 0.8  # 静态/动态分离阈值 (0.6-0.9)
+CUSTOM_CLUSTER_RATIO = 0.5  # 空间聚类保留比例 (0.3-0.7)
+CUSTOM_TEMPORAL_SEGMENT_RATIO = 0.25  # 时序分段比例 (0.125-0.5)
+CUSTOM_DPC_KNN_K = 5  # DPC-KNN的k近邻参数
 
 # Stage 2: 基于注意力的Token选择
-# 注意：暂时禁用 Stage 2，专注测试 Stage 1
-ENABLE_STAGE2 = False  # 改为 False，只测试 Stage 1
-KEEP_RATIO = 0.5  # Token保留比例 (0.2-0.6)
-PRUNING_LAYER = 10  # 在哪一层进行剪枝 (5-15)
-ATTENTION_AGGREGATION = "max"  # 'max' or 'mean'
+CUSTOM_ENABLE_STAGE2 = True
+CUSTOM_KEEP_RATIO = 0.5  # Token保留比例 (0.2-0.6)
+CUSTOM_PRUNING_LAYER = 10  # 在哪一层进行剪枝 (5-15)
+CUSTOM_ATTENTION_AGGREGATION = "max"  # 'max' or 'mean'
+
+# Stage 3: KV缓存压缩
+CUSTOM_ENABLE_CACHE_COMPRESSION = True
 
 # 视频处理配置
 MAX_FRAMES = 16  # 最大帧数 (8, 16, 32)
-MIN_PIXELS = 224 * 224
-# 注意：Qwen2.5-VL在处理视频时有运行时限制602112 (约776x776)
-# 虽然配置文件中max_pixels=12845056，但实际处理视频时会有更严格的限制
-# 对于16帧: 使用 192x192每帧，总共 589824 pixels (在602112限制内)
-MAX_PIXELS = 192 * 192 * MAX_FRAMES  # 589824 < 602112
 
 # 生成配置
 MAX_NEW_TOKENS = 10  # EgoSchema是选择题，答案很短
@@ -69,13 +70,20 @@ VERBOSE = True  # 是否打印详细信息
 # ============================================================================
 
 # 设置CUDA设备
-os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_ID)
+if torch.cuda.is_available():
+    torch.cuda.set_device(GPU_ID)
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import PruneVidConfig
-from model_wrapper import Qwen25VLPruneVid
+from config import (
+    PruneVidConfig,
+    get_baseline_config,
+    get_paper_config,
+    get_conservative_config,
+    get_aggressive_config
+)
+from model_wrapper import PruneVidQwen25VL
 
 
 class EgoSchemaEvaluator:
@@ -83,7 +91,7 @@ class EgoSchemaEvaluator:
 
     def __init__(
         self,
-        model: Qwen25VLPruneVid,
+        model: PruneVidQwen25VL,
         video_dir: str,
         dataset_name: str = "lmms-lab/egoschema",
         dataset_split: str = "test",
@@ -102,6 +110,7 @@ class EgoSchemaEvaluator:
         self.total_tokens_before = 0
         self.total_tokens_after_stage1 = 0
         self.total_tokens_after_stage2 = 0
+        self.total_tokens_after = 0
         self.results = []
 
     def load_dataset(self):
@@ -150,15 +159,15 @@ class EgoSchemaEvaluator:
             return int(text)
 
         # 2. 字母形式 (A=0, B=1, C=2, D=3, E=4)
-        if text.startswith('a'):
+        if text.startswith('a') or text.startswith('option a'):
             return 0
-        elif text.startswith('b'):
+        elif text.startswith('b') or text.startswith('option b'):
             return 1
-        elif text.startswith('c'):
+        elif text.startswith('c') or text.startswith('option c'):
             return 2
-        elif text.startswith('d'):
+        elif text.startswith('d') or text.startswith('option d'):
             return 3
-        elif text.startswith('e'):
+        elif text.startswith('e') or text.startswith('option e'):
             return 4
 
         # 3. 包含"option X"或"选项 X"
@@ -180,7 +189,7 @@ class EgoSchemaEvaluator:
         # 6. 无法提取
         return None
 
-    def evaluate_sample(self, sample: Dict, sample_idx: int) -> Dict:
+    def evaluate_sample(self, sample: Dict, sample_idx: int) -> Optional[Dict]:
         """
         评估单个样本
 
@@ -210,11 +219,11 @@ class EgoSchemaEvaluator:
                 max_new_tokens=MAX_NEW_TOKENS,
                 temperature=TEMPERATURE,
                 do_sample=DO_SAMPLE,
-                return_dict=True,
+                return_stats=True,
             )
 
-            generated_text = result['generated_text']
-            compression_stats = result['compression_stats']
+            generated_text = result['answer']
+            stats = result.get('stats', {})
 
             # 提取答案
             predicted_answer = self.extract_answer(generated_text)
@@ -224,16 +233,19 @@ class EgoSchemaEvaluator:
             is_correct = (predicted_answer == ground_truth)
 
             # 获取token统计
-            tokens_before = compression_stats['tokens_before']
-            tokens_after = compression_stats['tokens_after']
+            # 从新实现的stats格式中提取信息
+            stage1_stats = stats.get('stage1', {})
+            stage2_stats = stats.get('stage2', {})
 
-            # 获取各阶段的token数量
-            detailed_stats = compression_stats.get('detailed_stats', {})
-            stage1_stats = detailed_stats.get('stage1', {})
-            stage3_stats = detailed_stats.get('stage3', {})
+            tokens_before = stage1_stats.get('original_tokens', 0)
+            tokens_after_stage1 = stage1_stats.get('compressed_tokens', tokens_before)
+            tokens_after_stage2 = stage2_stats.get('compressed_tokens', tokens_after_stage1)
 
-            tokens_after_stage1 = stage1_stats.get('tokens_after', tokens_before) if stage1_stats.get('enabled', False) else tokens_before
-            tokens_after_stage2 = stage3_stats.get('kept_visual_tokens', tokens_after_stage1) if stage3_stats.get('compressed', False) else tokens_after_stage1
+            # 如果没有stage1统计，使用input_tokens
+            if tokens_before == 0:
+                tokens_before = result.get('input_tokens', 0)
+                tokens_after_stage1 = tokens_before
+                tokens_after_stage2 = tokens_before
 
             # 返回结果
             return {
@@ -247,8 +259,8 @@ class EgoSchemaEvaluator:
                 'tokens_before': tokens_before,
                 'tokens_after_stage1': tokens_after_stage1,
                 'tokens_after_stage2': tokens_after_stage2,
-                'tokens_after': tokens_after,
-                'compression_stats': compression_stats,
+                'tokens_after': tokens_after_stage2,
+                'stats': stats,
             }
 
         except Exception as e:
@@ -338,6 +350,7 @@ class EgoSchemaEvaluator:
             self.total_tokens_before += result['tokens_before']
             self.total_tokens_after_stage1 += result['tokens_after_stage1']
             self.total_tokens_after_stage2 += result['tokens_after_stage2']
+            self.total_tokens_after += result['tokens_after']
 
             self.results.append(result)
 
@@ -393,30 +406,16 @@ class EgoSchemaEvaluator:
 
         # 生成文件名
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        stage_suffix = ""
-        if ENABLE_STAGE1 and ENABLE_STAGE2:
-            stage_suffix = f"_s1s2_tau{TAU}_keep{KEEP_RATIO}"
-        elif ENABLE_STAGE1:
-            stage_suffix = f"_s1_tau{TAU}"
-        elif ENABLE_STAGE2:
-            stage_suffix = f"_s2_keep{KEEP_RATIO}"
-        else:
-            stage_suffix = "_baseline"
-
-        filename = f"egoschema_results_{timestamp}{stage_suffix}.json"
+        filename = f"egoschema_results_{timestamp}_{CONFIG_MODE}.json"
         filepath = os.path.join(OUTPUT_DIR, filename)
 
         # 准备保存的数据
         save_data = {
             'config': {
-                'enable_stage1': ENABLE_STAGE1,
-                'tau': TAU,
-                'cluster_ratio': CLUSTER_RATIO,
-                'temporal_segment_ratio': TEMPORAL_SEGMENT_RATIO,
-                'enable_stage2': ENABLE_STAGE2,
-                'keep_ratio': KEEP_RATIO,
-                'pruning_layer': PRUNING_LAYER,
+                'config_mode': CONFIG_MODE,
+                'model_config': self.model.config.to_dict(),
                 'max_frames': MAX_FRAMES,
+                'num_samples': NUM_SAMPLES,
             },
             'summary': {
                 'total_samples': self.total_samples,
@@ -439,55 +438,76 @@ class EgoSchemaEvaluator:
 def main():
     """主函数"""
     print(f"\n{'='*80}")
-    print(f"EgoSchema Evaluation - PruneVid for Qwen2.5-VL")
+    print(f"EgoSchema Evaluation - PruneVid for Qwen2.5-VL (New Implementation)")
     print(f"{'='*80}\n")
 
+    # 创建配置
+    if CONFIG_MODE == "baseline":
+        config = get_baseline_config()
+        print("Using BASELINE config (no pruning)")
+    elif CONFIG_MODE == "paper":
+        config = get_paper_config()
+        print("Using PAPER config (tau=0.8, keep_ratio=0.4)")
+    elif CONFIG_MODE == "conservative":
+        config = get_conservative_config()
+        print("Using CONSERVATIVE config (high compression)")
+    elif CONFIG_MODE == "aggressive":
+        config = get_aggressive_config()
+        print("Using AGGRESSIVE config (low compression)")
+    elif CONFIG_MODE == "custom":
+        config = PruneVidConfig(
+            # Stage 1
+            enable_stage1=CUSTOM_ENABLE_STAGE1,
+            tau=CUSTOM_TAU,
+            cluster_ratio=CUSTOM_CLUSTER_RATIO,
+            temporal_segment_ratio=CUSTOM_TEMPORAL_SEGMENT_RATIO,
+            dpc_knn_k=CUSTOM_DPC_KNN_K,
+            # Stage 2
+            enable_stage2=CUSTOM_ENABLE_STAGE2,
+            keep_ratio=CUSTOM_KEEP_RATIO,
+            pruning_layer=CUSTOM_PRUNING_LAYER,
+            attention_aggregation=CUSTOM_ATTENTION_AGGREGATION,
+            # Stage 3
+            enable_cache_compression=CUSTOM_ENABLE_CACHE_COMPRESSION,
+            # Video
+            max_frames=MAX_FRAMES,
+            # Debug
+            verbose=VERBOSE,
+            collect_stats=True,
+        )
+        print("Using CUSTOM config")
+    else:
+        raise ValueError(f"Unknown CONFIG_MODE: {CONFIG_MODE}")
+
+    # 更新max_frames
+    config.max_frames = MAX_FRAMES
+
     # 打印配置
-    print("Configuration:")
+    print(f"\nConfiguration:")
     print(f"  GPU: {GPU_ID} (device: {DEVICE})")
     print(f"  Model: {MODEL_PATH}")
     print(f"  Dataset: {DATASET_NAME} ({DATASET_SPLIT})")
     print(f"  Video dir: {VIDEO_DIR}")
     print(f"\nPruneVid Settings:")
-    print(f"  Stage 1: {'ON' if ENABLE_STAGE1 else 'OFF'}")
-    if ENABLE_STAGE1:
-        print(f"    - tau: {TAU}")
-        print(f"    - cluster_ratio: {CLUSTER_RATIO}")
-        print(f"    - temporal_segment_ratio: {TEMPORAL_SEGMENT_RATIO}")
-    print(f"  Stage 2: {'ON' if ENABLE_STAGE2 else 'OFF'}")
-    if ENABLE_STAGE2:
-        print(f"    - keep_ratio: {KEEP_RATIO}")
-        print(f"    - pruning_layer: {PRUNING_LAYER}")
+    print(f"  Stage 1: {'ON' if config.enable_stage1 else 'OFF'}")
+    if config.enable_stage1:
+        print(f"    - tau: {config.tau}")
+        print(f"    - cluster_ratio: {config.cluster_ratio}")
+        print(f"    - temporal_segment_ratio: {config.temporal_segment_ratio}")
+    print(f"  Stage 2: {'ON' if config.enable_stage2 else 'OFF'}")
+    if config.enable_stage2:
+        print(f"    - keep_ratio: {config.keep_ratio}")
+        print(f"    - pruning_layer: {config.pruning_layer}")
+    print(f"  Stage 3: {'ON' if config.enable_cache_compression else 'OFF'}")
     print(f"\nTest Settings:")
     print(f"  Num samples: {NUM_SAMPLES if NUM_SAMPLES else 'All'}")
     print(f"  Start index: {START_INDEX}")
     print(f"  Max frames: {MAX_FRAMES}")
     print(f"\n{'='*80}\n")
 
-    # 创建配置
-    config = PruneVidConfig(
-        enable_stage1=ENABLE_STAGE1,
-        tau=TAU,
-        cluster_ratio=CLUSTER_RATIO,
-        temporal_segment_ratio=TEMPORAL_SEGMENT_RATIO,
-        dpc_knn_k=DPC_KNN_K,
-        enable_pruning=ENABLE_STAGE2,
-        keep_ratio=KEEP_RATIO,
-        pruning_layer=PRUNING_LAYER,
-        attention_aggregation=ATTENTION_AGGREGATION,
-        max_frames=MAX_FRAMES,
-        min_pixels=MIN_PIXELS,
-        max_pixels=MAX_PIXELS,
-        max_new_tokens=MAX_NEW_TOKENS,
-        temperature=TEMPERATURE,
-        do_sample=DO_SAMPLE,
-        device=DEVICE,
-        verbose=VERBOSE,
-    )
-
     # 加载模型
     print("Loading model...")
-    model = Qwen25VLPruneVid(
+    model = PruneVidQwen25VL(
         model_path=MODEL_PATH,
         config=config,
         device=DEVICE,

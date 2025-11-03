@@ -18,14 +18,13 @@ Stage 1: 时空Token合并
 
 import torch
 import torch.nn as nn
-import os
 from typing import Dict, List, Tuple, Optional
 from utils import (
     temporal_clustering_continuous,
     detect_static_tokens,
     dpc_knn_clustering,
     merge_tokens_by_labels,
-    # average_position_embeddings,  # 已废弃 - 不再使用，直接平均cos/sin是数学错误
+    average_position_embeddings,
     average_position_ids,
     compute_compression_stats,
 )
@@ -94,12 +93,16 @@ class SpatialTemporalTokenMerger(nn.Module):
         # 提取视觉部分的position_ids
         visual_position_ids = position_ids[:, :, visual_token_start:visual_token_end]  # [3, batch, num_visual]
 
-        # 注意：不再处理position_embeddings (cos, sin)
-        # 这些将在Stage 1完成后由模型层重新计算，以确保数学正确性
+        # 提取position_embeddings（如果有的话）
+        cos, sin = position_embeddings
+        visual_cos = cos[:, :, visual_token_start:visual_token_end, :]  # [3, batch, num_visual, head_dim]
+        visual_sin = sin[:, :, visual_token_start:visual_token_end, :]
 
         # 处理batch - 循环处理每个batch样本
         batch_results_hidden = []
         batch_results_pos_ids = []
+        batch_results_cos = []
+        batch_results_sin = []
         batch_stats = []
 
         for batch_idx in range(batch_size):
@@ -166,6 +169,8 @@ class SpatialTemporalTokenMerger(nn.Module):
             # 步骤3：对每个场景段处理
             merged_tokens_list = []
             merged_position_ids_list = []
+            merged_cos_list = []
+            merged_sin_list = []
     
             total_static_tokens = 0
             total_dynamic_tokens = 0
@@ -210,56 +215,27 @@ class SpatialTemporalTokenMerger(nn.Module):
                     else:
                         final_static = merged_static  # 只有1个，不需要聚类
     
-                    # 位置信息处理：
-                    # 1. 收集所有帧的时间位置（静态token在整个时间段存在）
-                    temporal_positions_list = []
-                    for frame_idx in seg_frames:
-                        frame_indices = indices_per_frame[frame_idx]
-                        static_frame_indices = frame_indices[static_mask]
-
-                        # 安全检查：确保索引有效
-                        if len(static_frame_indices) == 0:
-                            continue
-
-                        frame_pos_ids = visual_position_ids_single[:, static_frame_indices]  # [3, num_static]
-                        temporal_positions_list.append(frame_pos_ids[0])  # 只取时间维度(dim 0)
-
-                    # 2. 计算平均时间位置（代表整个时间段）
-                    if len(temporal_positions_list) > 0:
-                        avg_temporal_position = torch.stack(temporal_positions_list, dim=0).float().mean(dim=0).round().long()  # [num_static]
-                    else:
-                        # 回退：使用第一帧的时间位置
-                        first_frame_idx = seg_frames[0]
-                        frame_indices = indices_per_frame[first_frame_idx]
-                        static_indices = frame_indices[static_mask]
-                        frame_pos_ids = visual_position_ids_single[:, static_indices]
-                        avg_temporal_position = frame_pos_ids[0]
-
-                    # 3. 使用第一帧的空间位置（静态token的空间位置应该一致）
+                    # 位置信息：取该段第一帧的静态token位置
                     first_frame_idx = seg_frames[0]
                     first_frame_indices = indices_per_frame[first_frame_idx]
                     static_indices = first_frame_indices[static_mask]
-                    static_pos_ids = visual_position_ids_single[:, static_indices].clone()  # [3, num_static]
-
-                    # 4. 如果进行了空间聚类，先平均空间位置
+    
+                    # 提取position_ids和embeddings
+                    static_pos_ids = visual_position_ids_single[:, static_indices]  # [3, num_static]
+                    static_pos_cos = visual_cos[:, batch_idx, static_indices, :]  # [3, num_static, head_dim]
+                    static_pos_sin = visual_sin[:, batch_idx, static_indices, :]
+    
+                    # 如果进行了聚类，需要平均位置信息
                     if num_static > 1:
-                        # average_position_ids会平均所有维度，但我们需要保留时间维度
                         static_pos_ids = average_position_ids(static_pos_ids, static_labels)
-
-                        # 5. 空间聚类后，重新设置时间维度为整个时间段的平均值
-                        # 注意：聚类后可能有K个cluster，需要对每个cluster设置相同的平均时间位置
-                        # 对每个cluster，使用对应原始token的平均时间位置
-                        for cluster_idx, label in enumerate(static_labels.unique().sort()[0]):
-                            mask = static_labels == label
-                            # 该cluster对应的原始token的平均时间位置
-                            cluster_avg_time = avg_temporal_position[mask].float().mean().round().long()
-                            static_pos_ids[0, cluster_idx] = cluster_avg_time
-                    else:
-                        # 5. 只有一个静态token，直接设置时间维度
-                        static_pos_ids[0] = avg_temporal_position
-
+                        static_pos_cos, static_pos_sin = average_position_embeddings(
+                            (static_pos_cos, static_pos_sin), static_labels
+                        )
+    
                     merged_tokens_list.append(final_static)
                     merged_position_ids_list.append(static_pos_ids)
+                    merged_cos_list.append(static_pos_cos)
+                    merged_sin_list.append(static_pos_sin)
     
                     if self.verbose:
                         print(f"  静态token合并: {num_static} -> {final_static.shape[0]}")
@@ -286,14 +262,21 @@ class SpatialTemporalTokenMerger(nn.Module):
                         actual_frame_idx = seg_frames[frame_idx_in_seg]
                         frame_indices = indices_per_frame[actual_frame_idx]
                         dynamic_indices = frame_indices[dynamic_mask]
-
+    
                         dynamic_pos_ids = visual_position_ids_single[:, dynamic_indices]
-
+                        dynamic_pos_cos = visual_cos[:, batch_idx, dynamic_indices, :]
+                        dynamic_pos_sin = visual_sin[:, batch_idx, dynamic_indices, :]
+    
                         if num_dynamic > 1:
                             dynamic_pos_ids = average_position_ids(dynamic_pos_ids, dynamic_labels)
-
+                            dynamic_pos_cos, dynamic_pos_sin = average_position_embeddings(
+                                (dynamic_pos_cos, dynamic_pos_sin), dynamic_labels
+                            )
+    
                         merged_tokens_list.append(final_dynamic)
                         merged_position_ids_list.append(dynamic_pos_ids)
+                        merged_cos_list.append(dynamic_pos_cos)
+                        merged_sin_list.append(dynamic_pos_sin)
     
                     if self.verbose:
                         print(f"  动态token处理: {num_dynamic} -> {final_dynamic.shape[0]} (每帧)")
@@ -302,6 +285,8 @@ class SpatialTemporalTokenMerger(nn.Module):
             if len(merged_tokens_list) > 0:
                 all_merged_tokens = torch.cat(merged_tokens_list, dim=0)  # [total_merged, hidden_dim]
                 all_merged_pos_ids = torch.cat(merged_position_ids_list, dim=1)  # [3, total_merged]
+                all_merged_cos = torch.cat(merged_cos_list, dim=1)  # [3, total_merged, head_dim]
+                all_merged_sin = torch.cat(merged_sin_list, dim=1)
             else:
                 # 没有token（不应该发生）
                 raise RuntimeError("合并后没有token！")
@@ -316,6 +301,8 @@ class SpatialTemporalTokenMerger(nn.Module):
             # 收集当前batch的结果
             batch_results_hidden.append(all_merged_tokens)  # [num_merged, hidden_dim]
             batch_results_pos_ids.append(all_merged_pos_ids)  # [3, num_merged]
+            batch_results_cos.append(all_merged_cos)  # [3, num_merged, head_dim]
+            batch_results_sin.append(all_merged_sin)  # [3, num_merged, head_dim]
 
             # 收集统计信息
             batch_stats.append({
@@ -344,6 +331,10 @@ class SpatialTemporalTokenMerger(nn.Module):
         # batch_results_pos_ids: List[[3, num_merged]] -> [3, batch, num_merged]
         all_merged_pos_ids = torch.stack(batch_results_pos_ids, dim=1)
 
+        # batch_results_cos/sin: List[[3, num_merged, head_dim]] -> [3, batch, num_merged, head_dim]
+        all_merged_cos = torch.stack(batch_results_cos, dim=1)
+        all_merged_sin = torch.stack(batch_results_sin, dim=1)
+
         # 重建完整序列（文本token + 合并后的视觉token）
         # [batch, seq_len, hidden_dim] -> [文本前] + [视觉] + [文本后]
         text_before = hidden_states[:, :visual_token_start, :]
@@ -358,19 +349,16 @@ class SpatialTemporalTokenMerger(nn.Module):
 
         new_position_ids = torch.cat([pos_ids_before, all_merged_pos_ids, pos_ids_after], dim=2)
 
-        # 不再返回position_embeddings - 将由模型层基于新的position_ids重新计算
-        # 这确保RoPE embeddings在数学上正确: cos(avg(θ)) 而不是错误的 avg(cos(θ))
-        new_position_embeddings = None
+        # 重建position_embeddings
+        cos_before = cos[:, :, :visual_token_start, :]
+        cos_after = cos[:, :, visual_token_end:, :]
+        sin_before = sin[:, :, :visual_token_start, :]
+        sin_after = sin[:, :, visual_token_end:, :]
 
-        # 🔍 调试：检查position_ids的有效性
-        if os.environ.get('PRUNEVID_DEBUG') == '1':
-            print(f"[Stage 1 Debug] new_position_ids shape: {new_position_ids.shape}")
-            print(f"[Stage 1 Debug] new_position_ids range: [{new_position_ids.min()}, {new_position_ids.max()}]")
-            print(f"[Stage 1 Debug] new_position_ids contains NaN: {torch.isnan(new_position_ids).any()}")
-            print(f"[Stage 1 Debug] new_position_ids contains Inf: {torch.isinf(new_position_ids).any()}")
-            print(f"[Stage 1 Debug] temporal positions (dim 0): min={new_position_ids[0].min()}, max={new_position_ids[0].max()}")
-            print(f"[Stage 1 Debug] spatial H (dim 1): min={new_position_ids[1].min()}, max={new_position_ids[1].max()}")
-            print(f"[Stage 1 Debug] spatial W (dim 2): min={new_position_ids[2].min()}, max={new_position_ids[2].max()}")
+        new_cos = torch.cat([cos_before, all_merged_cos, cos_after], dim=2)
+        new_sin = torch.cat([sin_before, all_merged_sin, sin_after], dim=2)
+
+        new_position_embeddings = (new_cos, new_sin)
 
         # 聚合统计信息
         if batch_size > 0:

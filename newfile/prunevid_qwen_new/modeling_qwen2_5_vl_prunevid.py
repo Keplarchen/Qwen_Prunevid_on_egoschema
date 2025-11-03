@@ -337,42 +337,8 @@ def load_prunevid_model(
     # 创建我们的PruneVid模型，使用相同的config
     model = Qwen2_5_VLForConditionalGeneration(pretrained_model.config, prunevid_config=config)
 
-    # 🔧 关键修复：转换权重keys以匹配PruneVid的模型结构
-    # transformers的原始结构: model.visual.*, model.language_model.*
-    # PruneVid的结构: visual.*, model.*
-    def convert_state_dict_keys(state_dict):
-        """转换transformers的state_dict keys到PruneVid格式"""
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            # 转换visual部分: model.visual.* -> visual.*
-            if key.startswith('model.visual.'):
-                new_key = key.replace('model.visual.', 'visual.')
-            # 转换language model部分: model.language_model.* -> model.*
-            elif key.startswith('model.language_model.'):
-                new_key = key.replace('model.language_model.', 'model.')
-            # 其他保持不变
-            else:
-                new_key = key
-            new_state_dict[new_key] = value
-        return new_state_dict
-
-    # 转换原始模型的state_dict
-    print("[PruneVid] Converting state_dict keys to match PruneVid structure...")
-    converted_state_dict = convert_state_dict_keys(pretrained_model.state_dict())
-
     # 复制权重（pretrained_model已经在目标设备上）
-    # 使用strict=True确保权重完全匹配，避免静默的权重加载错误
-    try:
-        model.load_state_dict(converted_state_dict, strict=True)
-        print("[PruneVid] ✅ Successfully loaded all weights with strict=True")
-    except RuntimeError as e:
-        print(f"[PruneVid WARNING] Failed to load weights with strict=True: {e}")
-        print("[PruneVid] Falling back to strict=False...")
-        missing_keys, unexpected_keys = model.load_state_dict(converted_state_dict, strict=False)
-        if missing_keys:
-            print(f"[PruneVid WARNING] Missing keys ({len(missing_keys)}): {missing_keys[:5]}...")
-        if unexpected_keys:
-            print(f"[PruneVid WARNING] Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:5]}...")
+    model.load_state_dict(pretrained_model.state_dict(), strict=False)
 
     # 确保模型在正确的设备上
     if device != "cpu":

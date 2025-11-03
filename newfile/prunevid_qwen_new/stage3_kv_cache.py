@@ -23,7 +23,7 @@ K̃^(l) = [K̃_v^(l); K_q^(l)]
 
 import torch
 from typing import List, Tuple, Optional, Dict
-from transformers.cache_utils import DynamicCache, DynamicLayer
+from transformers.cache_utils import DynamicCache
 
 
 class PruneVidDynamicCache(DynamicCache):
@@ -44,7 +44,6 @@ class PruneVidDynamicCache(DynamicCache):
         Args:
             verbose: 是否输出详细日志
         """
-        # 调用父类初始化,会自动使用DynamicLayer
         super().__init__()
 
         # PruneVid相关配置
@@ -134,8 +133,8 @@ class PruneVidDynamicCache(DynamicCache):
             self.compressed = True
 
             # 返回压缩后的当前层KV
-            updated_key = self.layers[layer_idx].keys
-            updated_value = self.layers[layer_idx].values
+            updated_key = self.key_cache[layer_idx]
+            updated_value = self.value_cache[layer_idx]
 
         return updated_key, updated_value
 
@@ -153,28 +152,24 @@ class PruneVidDynamicCache(DynamicCache):
             return
 
         # 获取当前缓存的序列长度（从第0层的key获取）
-        if len(self.layers) == 0:
+        if len(self.key_cache) == 0:
             if self.verbose:
                 print("[Stage 3] 警告：缓存为空，跳过压缩")
             return
 
         # 示例key shape: [batch, num_heads, seq_len, head_dim]
-        original_seq_len = self.layers[0].keys.shape[2]
+        original_seq_len = self.key_cache[0].shape[2]
 
         # 构建保留的索引
         # [0, ..., visual_start-1] + [selected visual] + [visual_end, ..., seq_len-1]
-        device = self.layers[0].keys.device
+        device = self.key_cache[0].device
 
         text_before = torch.arange(0, self.visual_token_start, device=device)
         selected_visual = self.selected_visual_indices + self.visual_token_start
+        text_after = torch.arange(self.visual_token_end, original_seq_len, device=device)
 
-        # 检查是否有文本tokens在视觉tokens之后
-        if self.visual_token_end < original_seq_len:
-            text_after = torch.arange(self.visual_token_end, original_seq_len, device=device)
-            kept_indices = torch.cat([text_before, selected_visual, text_after], dim=0)
-        else:
-            # 没有文本tokens在视觉tokens之后
-            kept_indices = torch.cat([text_before, selected_visual], dim=0)
+        # 合并
+        kept_indices = torch.cat([text_before, selected_visual, text_after], dim=0)
 
         new_seq_len = kept_indices.shape[0]
 
@@ -186,13 +181,13 @@ class PruneVidDynamicCache(DynamicCache):
 
         # 压缩layers 0 到 pruning_layer
         for layer_idx in range(self.pruning_layer + 1):
-            if layer_idx < len(self.layers):
-                # keys: [batch, num_heads, seq_len, head_dim]
-                self.layers[layer_idx].keys = self.layers[layer_idx].keys[:, :, kept_indices, :]
-                self.layers[layer_idx].values = self.layers[layer_idx].values[:, :, kept_indices, :]
+            if layer_idx < len(self.key_cache):
+                # key_cache[layer_idx]: [batch, num_heads, seq_len, head_dim]
+                self.key_cache[layer_idx] = self.key_cache[layer_idx][:, :, kept_indices, :]
+                self.value_cache[layer_idx] = self.value_cache[layer_idx][:, :, kept_indices, :]
 
                 if self.verbose and layer_idx == 0:
-                    print(f"  示例：Layer 0 KV shape: {self.layers[0].keys.shape}")
+                    print(f"  示例：Layer 0 KV shape: {self.key_cache[0].shape}")
 
         # 记录统计
         self.compression_stats = {
@@ -227,6 +222,48 @@ class PruneVidDynamicCache(DynamicCache):
 
         if self.verbose:
             print("[Stage 3] KV缓存已重置")
+
+
+# 测试示例（可选）
+def test_prunevid_cache():
+    """测试PruneVidDynamicCache"""
+    print("Testing PruneVidDynamicCache...")
+
+    cache = PruneVidDynamicCache(verbose=True)
+
+    # 配置压缩
+    cache.configure_pruning(
+        pruning_layer=2,
+        visual_token_start=5,
+        visual_token_end=15,
+        selected_visual_indices=torch.tensor([5, 7, 9, 11]),  # 全局索引
+    )
+
+    # 模拟添加KV cache
+    batch_size = 1
+    num_heads = 8
+    seq_len = 20
+    head_dim = 64
+
+    for layer_idx in range(5):
+        key = torch.randn(batch_size, num_heads, seq_len, head_dim)
+        value = torch.randn(batch_size, num_heads, seq_len, head_dim)
+
+        updated_key, updated_value = cache.update(key, value, layer_idx)
+
+        print(f"\nLayer {layer_idx}:")
+        print(f"  Key shape: {updated_key.shape}")
+        print(f"  Value shape: {updated_value.shape}")
+
+    # 检查压缩统计
+    stats = cache.get_compression_stats()
+    print(f"\n压缩统计: {stats}")
+
+    print("\nPruneVidDynamicCache test passed!")
+
+
+if __name__ == "__main__":
+    test_prunevid_cache()
 
 
 # 导出
