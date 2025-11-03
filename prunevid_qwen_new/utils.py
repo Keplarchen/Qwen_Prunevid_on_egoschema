@@ -306,31 +306,47 @@ def average_position_embeddings(
 
     Args:
         position_embeddings: Tuple of (cos, sin)
-                            cos/sin shape: [3, batch, seq_len, head_dim]
+                            cos/sin shape: [3, seq_len, head_dim] (单batch)
+                            或 [3, batch, seq_len, head_dim] (多batch)
                             (3对应时间、高度、宽度三个维度)
         labels: [seq_len] 聚类标签
 
     Returns:
-        merged_embeddings: Tuple of (cos, sin)，shape: [3, batch, K, head_dim]
+        merged_embeddings: Tuple of (cos, sin)
+                          shape: [3, K, head_dim] 或 [3, batch, K, head_dim]
     """
     cos, sin = position_embeddings
-    # cos/sin: [3, batch, seq_len, head_dim]
 
     unique_labels = labels.unique().sort()[0]
     K = len(unique_labels)
 
-    # 初始化合并后的embedding
-    merged_cos = torch.zeros(
-        cos.shape[0], cos.shape[1], K, cos.shape[3],
-        device=cos.device, dtype=cos.dtype
-    )
-    merged_sin = torch.zeros_like(merged_cos)
+    # 处理3维和4维情况
+    if cos.dim() == 3:
+        # [3, seq_len, head_dim] -> 单batch样本
+        merged_cos = torch.zeros(
+            cos.shape[0], K, cos.shape[2],
+            device=cos.device, dtype=cos.dtype
+        )
+        merged_sin = torch.zeros_like(merged_cos)
 
-    for i, label in enumerate(unique_labels):
-        mask = labels == label
-        # 平均cos和sin
-        merged_cos[:, :, i, :] = cos[:, :, mask, :].mean(dim=2)
-        merged_sin[:, :, i, :] = sin[:, :, mask, :].mean(dim=2)
+        for i, label in enumerate(unique_labels):
+            mask = labels == label
+            # 平均cos和sin
+            merged_cos[:, i, :] = cos[:, mask, :].mean(dim=1)
+            merged_sin[:, i, :] = sin[:, mask, :].mean(dim=1)
+    else:
+        # [3, batch, seq_len, head_dim] -> 多batch样本
+        merged_cos = torch.zeros(
+            cos.shape[0], cos.shape[1], K, cos.shape[3],
+            device=cos.device, dtype=cos.dtype
+        )
+        merged_sin = torch.zeros_like(merged_cos)
+
+        for i, label in enumerate(unique_labels):
+            mask = labels == label
+            # 平均cos和sin
+            merged_cos[:, :, i, :] = cos[:, :, mask, :].mean(dim=2)
+            merged_sin[:, :, i, :] = sin[:, :, mask, :].mean(dim=2)
 
     return (merged_cos, merged_sin)
 
@@ -342,30 +358,47 @@ def average_position_ids(
     """
     根据聚类标签平均Position IDs
 
-    Qwen2.5-VL的position_ids是3D的：[3, batch, seq_len]
+    Qwen2.5-VL的position_ids可以是2D或3D的：
+    - 2D: [3, seq_len] (单个batch样本)
+    - 3D: [3, batch, seq_len] (多个batch样本)
     分别对应时间、高度、宽度
 
     Args:
-        position_ids: [3, batch, seq_len]
+        position_ids: [3, seq_len] 或 [3, batch, seq_len]
         labels: [seq_len] 聚类标签
 
     Returns:
-        merged_position_ids: [3, batch, K]
+        merged_position_ids: [3, K] 或 [3, batch, K]
     """
     unique_labels = labels.unique().sort()[0]
     K = len(unique_labels)
     device = position_ids.device
 
-    merged_ids = torch.zeros(
-        3, position_ids.shape[1], K,
-        device=device, dtype=position_ids.dtype
-    )
+    # 处理2维和3维情况
+    if position_ids.dim() == 2:
+        # [3, seq_len] -> 处理为2维
+        merged_ids = torch.zeros(
+            3, K,
+            device=device, dtype=position_ids.dtype
+        )
 
-    for i, label in enumerate(unique_labels):
-        mask = labels == label
-        # 对每个维度分别平均（然后取整）
-        for dim in range(3):
-            merged_ids[dim, :, i] = position_ids[dim, :, mask].float().mean(dim=1).round().long()
+        for i, label in enumerate(unique_labels):
+            mask = labels == label
+            # 对每个维度分别平均（然后取整）
+            for dim in range(3):
+                merged_ids[dim, i] = position_ids[dim, mask].float().mean().round().long()
+    else:
+        # [3, batch, seq_len] -> 处理为3维
+        merged_ids = torch.zeros(
+            3, position_ids.shape[1], K,
+            device=device, dtype=position_ids.dtype
+        )
+
+        for i, label in enumerate(unique_labels):
+            mask = labels == label
+            # 对每个维度分别平均（然后取整）
+            for dim in range(3):
+                merged_ids[dim, :, i] = position_ids[dim, :, mask].float().mean(dim=1).round().long()
 
     return merged_ids
 

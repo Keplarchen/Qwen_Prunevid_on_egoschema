@@ -301,9 +301,9 @@ def load_prunevid_model(
     config: Optional[PruneVidConfig] = None,
     device: str = "cuda",
     torch_dtype: torch.dtype = torch.bfloat16,
-) -> Tuple[Qwen2VLForConditionalGenerationWithPruneVid, AutoProcessor]:
+):
     """
-    加载集成PruneVid的Qwen2.5-VL模型
+    加载集成PruneVid的Qwen2.5-VL模型（使用DTD-based实现）
 
     Args:
         model_name_or_path: 模型路径或HuggingFace ID
@@ -316,28 +316,48 @@ def load_prunevid_model(
         processor: 对应的processor
     """
     from config import get_baseline_config
+    from modeling_qwen2_5_vl_prunevid_dtd import Qwen2_5_VLForConditionalGeneration
+    from configuration_qwen2_5_vl import Qwen2_5_VLConfig
 
     if config is None:
         config = get_baseline_config()
 
-    # 加载基础模型
+    # 直接使用transformers加载，然后包装
     print(f"加载Qwen2.5-VL模型: {model_name_or_path}")
-    base_model = AutoModelForVision2Seq.from_pretrained(
+
+    # 先直接加载预训练模型到目标设备
+    from transformers import AutoModelForVision2Seq
+    pretrained_model = AutoModelForVision2Seq.from_pretrained(
         model_name_or_path,
         torch_dtype=torch_dtype,
         device_map=device if device != "cpu" else None,
         trust_remote_code=True,
     )
 
+    # 创建我们的PruneVid模型，使用相同的config
+    model = Qwen2_5_VLForConditionalGeneration(pretrained_model.config, prunevid_config=config)
+
+    # 复制权重（pretrained_model已经在目标设备上）
+    model.load_state_dict(pretrained_model.state_dict(), strict=False)
+
+    # 确保模型在正确的设备上
+    if device != "cpu":
+        model = model.to(device)
+
+    model.eval()
+
+    # 删除pretrained_model释放内存
+    del pretrained_model
+    import gc
+    gc.collect()
+    if device != "cpu":
+        torch.cuda.empty_cache()
+
     # 加载processor
     processor = AutoProcessor.from_pretrained(
         model_name_or_path,
         trust_remote_code=True,
     )
-
-    # 包装为PruneVid模型
-    model = Qwen2VLForConditionalGenerationWithPruneVid(base_model, config)
-    model.eval()
 
     print(f"PruneVid模型加载完成")
     print(f"  配置: {config.to_dict()}")
