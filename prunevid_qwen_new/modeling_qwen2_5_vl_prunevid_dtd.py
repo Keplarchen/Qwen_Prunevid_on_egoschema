@@ -209,10 +209,20 @@ class Qwen2_5_VLVisionFlashAttention2(nn.Module):
         q = q.squeeze(0)
         k = k.squeeze(0)
 
+        # 🔧 确保 FlashAttention2 数据类型兼容 (只支持 fp16/bf16)
+        target_dtype = self.qkv.weight.dtype
+        if target_dtype not in [torch.float16, torch.bfloat16]:
+            target_dtype = torch.bfloat16
+        q = q.to(target_dtype)
+        k = k.to(target_dtype)
+        v = v.to(target_dtype)
+
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
             seq_length, -1
         )
+        # 转换回原始 dtype 以匹配 proj 权重
+        attn_output = attn_output.to(self.proj.weight.dtype)
         attn_output = self.proj(attn_output)
         return attn_output
 
@@ -903,6 +913,15 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
         else:
             sliding_window = None
 
+        # 🔧 确保 FlashAttention2 数据类型兼容 (只支持 fp16/bf16)
+        original_dtype = query_states.dtype  # 保存原始 dtype
+        target_dtype = self.q_proj.weight.dtype
+        if target_dtype not in [torch.float16, torch.bfloat16]:
+            target_dtype = torch.bfloat16
+        query_states = query_states.to(target_dtype)
+        key_states = key_states.to(target_dtype)
+        value_states = value_states.to(target_dtype)
+
         attn_output = _flash_attention_forward(
             query_states,
             key_states,
@@ -916,10 +935,12 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
         )
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        # 转换回原始 dtype 以匹配 o_proj 权重
+        attn_output = attn_output.to(self.o_proj.weight.dtype)
         attn_output = self.o_proj(attn_output)
 
-        if not output_attentions:
-            attn_weights = None
+        # FlashAttention2 不返回 attention weights
+        attn_weights = None
 
         return attn_output, attn_weights, past_key_value
 

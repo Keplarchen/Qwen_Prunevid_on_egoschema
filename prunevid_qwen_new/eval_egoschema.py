@@ -18,7 +18,7 @@ from datasets import load_dataset
 # ============================================================================
 
 # GPU配置
-GPU_ID = 2 # 使用哪块GPU（0, 1, 2, ...）
+GPU_ID = 1 # 使用哪块GPU（0, 1, 2, ...）
 DEVICE = f"cuda:{GPU_ID}"
 
 # 数据集配置
@@ -35,26 +35,26 @@ CONFIG_MODE = "custom"  # 可选: "baseline", "paper", "conservative", "aggressi
 
 # 自定义配置（仅当CONFIG_MODE="custom"时使用）
 # Stage 1: 时空Token合并
-CUSTOM_ENABLE_STAGE1 = False
-CUSTOM_TAU = 0.8  # 静态/动态分离阈值 (0.6-0.9)
-CUSTOM_CLUSTER_RATIO = 0.5  # 空间聚类保留比例 (0.3-0.7)
-CUSTOM_TEMPORAL_SEGMENT_RATIO = 0.25  # 时序分段比例 (0.125-0.5)
+CUSTOM_ENABLE_STAGE1 = True  # ✅ 启用时空合并以压缩token
+CUSTOM_TAU = 0.8  # 静态/动态分离阈值 - 降低以检测更多静态token
+CUSTOM_CLUSTER_RATIO = 0.15  # 空间聚类保留比例 - 降低以节省显存
+CUSTOM_TEMPORAL_SEGMENT_RATIO = 0.2  # 时序分段比例 - 降低以更细粒度分段
 CUSTOM_DPC_KNN_K = 5  # DPC-KNN的k近邻参数
 
 # Stage 2: 基于注意力的Token选择
-CUSTOM_ENABLE_STAGE2 = False   
-CUSTOM_KEEP_RATIO = 0.3  # Token保留比例 (0.2-0.6)
+CUSTOM_ENABLE_STAGE2 = False  # ✅ 启用注意力剪枝
+CUSTOM_KEEP_RATIO = 0.3  # Token保留比例 - 只保留30%最重要的token
 CUSTOM_PRUNING_LAYER = 10  # 在哪一层进行剪枝 (5-15)
 CUSTOM_ATTENTION_AGGREGATION = "max"  # 'max' or 'mean'
 
 # Stage 3: KV缓存压缩
-CUSTOM_ENABLE_CACHE_COMPRESSION = False
+CUSTOM_ENABLE_CACHE_COMPRESSION = True  # ✅ 启用缓存压缩
 
 # 视频处理配置
-MAX_FRAMES = 16  # 最大帧数 (8, 16, 32)
+MAX_FRAMES = 200  # 最大帧数 - 先从64开始测试，成功后再增加
 
 # 生成配置
-MAX_NEW_TOKENS = 10  # 给模型充分空间解释答案（去掉限制）
+MAX_NEW_TOKENS = 128  # 给模型充分空间解释答案（去掉限制）
 TEMPERATURE = 0.0  # 0表示greedy decoding
 DO_SAMPLE = False
 

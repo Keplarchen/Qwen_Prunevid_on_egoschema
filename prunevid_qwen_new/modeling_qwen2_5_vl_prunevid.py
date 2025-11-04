@@ -332,6 +332,7 @@ def load_prunevid_model(
         torch_dtype=torch_dtype,
         device_map=device if device != "cpu" else None,
         trust_remote_code=True,
+        attn_implementation="flash_attention_2",  # 使用FlashAttention2 (最优性能)
     )
 
     # 创建我们的PruneVid模型，使用相同的config

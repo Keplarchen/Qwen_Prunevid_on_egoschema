@@ -69,7 +69,7 @@ class PruneVidConfig:
     # ==================== 视频处理 ====================
 
     # 最大帧数
-    max_frames: int = 16
+    max_frames: int = 100
 
     # 视频采样方式："uniform"（均匀采样）或"fps"（基于FPS）
     video_sampling: str = "uniform"
@@ -276,6 +276,40 @@ def get_stage1_only_config() -> PruneVidConfig:
     )
 
 
+def get_high_frame_config(max_frames: int = 100) -> PruneVidConfig:
+    """
+    高帧率配置：优化用于处理100+帧的视频
+    使用更激进的压缩策略以控制内存使用
+
+    Args:
+        max_frames: 最大帧数，默认100
+
+    Returns:
+        PruneVidConfig: 针对高帧率优化的配置
+    """
+    return PruneVidConfig(
+        # Stage 1: 更激进的时空合并
+        tau=0.75,  # 更低阈值 = 检测更多静态token
+        cluster_ratio=0.4,  # 每个cluster保留更少token
+        temporal_segment_ratio=0.2,  # 更细粒度的时间分段
+        dpc_knn_k=5,
+        enable_stage1=True,
+        # Stage 2: 激进的token剪枝
+        keep_ratio=0.3,  # 只保留30%的token
+        pruning_layer=10,
+        attention_aggregation="max",
+        enable_stage2=True,
+        # Stage 3: 启用缓存压缩
+        enable_cache_compression=True,
+        # Video: 高帧率
+        max_frames=max_frames,
+        video_sampling="uniform",
+        # Debug
+        verbose=True,
+        collect_stats=True,
+    )
+
+
 # 导出所有配置获取函数
 __all__ = [
     "PruneVidConfig",
@@ -284,4 +318,5 @@ __all__ = [
     "get_conservative_config",
     "get_aggressive_config",
     "get_stage1_only_config",
+    "get_high_frame_config",
 ]

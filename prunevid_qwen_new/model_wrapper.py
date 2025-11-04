@@ -150,7 +150,7 @@ class PruneVidQwen25VL:
                 videos=[video_frames],  # videos参数需要batch格式：list[list[PIL.Image]]
                 padding=True,
                 return_tensors="pt",
-            ).to(self.device)
+            ).to(self.device, dtype=self.torch_dtype)
         else:
             # 图片处理
             inputs = self.processor(
@@ -159,7 +159,7 @@ class PruneVidQwen25VL:
                 videos=None,
                 padding=True,
                 return_tensors="pt",
-            ).to(self.device)
+            ).to(self.device, dtype=self.torch_dtype)
 
         # 生成
         print(f"开始生成... (输入tokens: {inputs['input_ids'].shape[1]})")
