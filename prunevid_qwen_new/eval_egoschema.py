@@ -18,7 +18,7 @@ from datasets import load_dataset
 # ============================================================================
 
 # GPU配置
-GPU_ID = 1 # 使用哪块GPU（0, 1, 2, ...）
+GPU_ID = 0 # 使用哪块GPU（0, 1, 2, ...）
 DEVICE = f"cuda:{GPU_ID}"
 
 # 数据集配置
@@ -35,9 +35,9 @@ CONFIG_MODE = "custom"  # 可选: "baseline", "paper", "conservative", "aggressi
 
 # 自定义配置（仅当CONFIG_MODE="custom"时使用）
 # Stage 1: 时空Token合并
-CUSTOM_ENABLE_STAGE1 = True  # ✅ 启用时空合并以压缩token
+CUSTOM_ENABLE_STAGE1 = False  # ✅ 启用时空合并以压缩token
 CUSTOM_TAU = 0.8  # 静态/动态分离阈值 - 降低以检测更多静态token
-CUSTOM_CLUSTER_RATIO = 0.15  # 空间聚类保留比例 - 降低以节省显存
+CUSTOM_CLUSTER_RATIO = 0.999  # 空间聚类保留比例 - 降低以节省显存
 CUSTOM_TEMPORAL_SEGMENT_RATIO = 0.2  # 时序分段比例 - 降低以更细粒度分段
 CUSTOM_DPC_KNN_K = 5  # DPC-KNN的k近邻参数
 
@@ -51,7 +51,12 @@ CUSTOM_ATTENTION_AGGREGATION = "max"  # 'max' or 'mean'
 CUSTOM_ENABLE_CACHE_COMPRESSION = True  # ✅ 启用缓存压缩
 
 # 视频处理配置
-MAX_FRAMES = 200  # 最大帧数 - 先从64开始测试，成功后再增加
+MAX_FRAMES = 360  # 最大帧数
+# 注意：已添加Qwen2.5动态分辨率机制！
+# - video_min_pixels = 128*32*32 (131,072像素/帧)
+# - video_max_pixels = 768*32*32 (786,432像素总预算)
+# - 200帧视频会自动降低每帧分辨率，避免OOM
+# - 预计visual tokens从~212万降至~800个
 
 # 生成配置
 MAX_NEW_TOKENS = 128  # 给模型充分空间解释答案（去掉限制）

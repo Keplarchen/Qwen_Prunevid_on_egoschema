@@ -388,10 +388,12 @@ def load_prunevid_model(
     if device != "cpu":
         torch.cuda.empty_cache()
 
-    # 加载processor
+    # 加载processor（添加动态分辨率参数）
     processor = AutoProcessor.from_pretrained(
         model_name_or_path,
         trust_remote_code=True,
+        min_pixels=config.video_min_pixels,  # 视频最小像素
+        max_pixels=config.video_max_pixels,  # 视频最大像素（总预算）
     )
 
     print(f"PruneVid模型加载完成")

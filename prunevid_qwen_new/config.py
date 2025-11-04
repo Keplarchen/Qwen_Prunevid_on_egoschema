@@ -74,11 +74,23 @@ class PruneVidConfig:
     # 视频采样方式："uniform"（均匀采样）或"fps"（基于FPS）
     video_sampling: str = "uniform"
 
-    # 最小像素数（用于视频分辨率规范化）
-    min_pixels: int = 224 * 224
+    # 图片处理的像素范围
+    # 最小像素数（用于图片分辨率规范化）
+    min_pixels: int = 256 * 28 * 28  # 200,704像素，约256 tokens
 
-    # 最大像素数
-    max_pixels: int = 1280 * 28 * 28
+    # 最大像素数（用于图片分辨率规范化）
+    max_pixels: int = 1280 * 28 * 28  # 1,003,520像素，约1280 tokens
+
+    # 视频处理的像素范围（基于Qwen2.5官方定义）
+    # 注意：这两个参数是所有帧的总像素数（T×H×W），不是每帧！
+    # 官方推荐范围：256 tokens ~ 16,384 tokens
+
+    # 视频总像素数下限（所有帧）
+    video_min_pixels: int = 256 * 32 * 32  # 262,144 总像素，约256 tokens总计
+
+    # 视频总像素数上限（所有帧）
+    # 使用较大的预算以支持高质量视频理解
+    video_max_pixels: int = 4096 * 32 * 32  # 4,194,304 总像素，约4096 tokens总计
 
     # ==================== 调试和日志 ====================
 
@@ -98,6 +110,10 @@ class PruneVidConfig:
         assert self.pruning_layer >= 0, f"pruning_layer必须>=0，当前值：{self.pruning_layer}"
         assert self.attention_aggregation in ["max", "mean"], \
             f"attention_aggregation必须是'max'或'mean'，当前值：{self.attention_aggregation}"
+        assert self.min_pixels > 0, f"min_pixels必须>0，当前值：{self.min_pixels}"
+        assert self.max_pixels >= self.min_pixels, f"max_pixels必须>=min_pixels，当前值：{self.max_pixels}"
+        assert self.video_min_pixels > 0, f"video_min_pixels必须>0，当前值：{self.video_min_pixels}"
+        assert self.video_max_pixels >= self.video_min_pixels, f"video_max_pixels必须>=video_min_pixels，当前值：{self.video_max_pixels}"
 
     def to_dict(self):
         """转换为字典格式"""
@@ -120,6 +136,8 @@ class PruneVidConfig:
             "video_sampling": self.video_sampling,
             "min_pixels": self.min_pixels,
             "max_pixels": self.max_pixels,
+            "video_min_pixels": self.video_min_pixels,
+            "video_max_pixels": self.video_max_pixels,
             # Debug
             "verbose": self.verbose,
             "collect_stats": self.collect_stats,

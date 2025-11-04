@@ -14,7 +14,7 @@ PruneVid高层API封装
 >>> print(result['answer'])
 >>> print(f"Token压缩率: {result['stats']['reduction_percentage']:.1f}%")
 """
-
+import pdb
 import torch
 from typing import Optional, Dict, Union, List
 from pathlib import Path
@@ -111,12 +111,19 @@ class PruneVidQwen25VL:
         if video_path is not None:
             # 加载视频
             video_frames = self._load_video(video_path)
-            # 构造messages（Qwen2.5-VL格式）
+            # 构造messages（Qwen2.5-VL格式，添加动态分辨率参数）
+            # 关键：使用total_pixels参数控制总像素预算
             messages = [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "video", "video": video_frames},
+                        {
+                            "type": "video",
+                            "video": video_frames,
+                            "min_pixels": self.config.video_min_pixels,
+                            "max_pixels": self.config.video_max_pixels,
+                            "total_pixels": self.config.video_max_pixels,  # 总像素预算（关键！）
+                        },
                         {"type": "text", "text": question},
                     ],
                 }
@@ -130,6 +137,7 @@ class PruneVidQwen25VL:
                 for img in images
             ]
             # 构造messages
+            # 注意：像素参数已在processor初始化时设置
             content = []
             for img in image_objects:
                 content.append({"type": "image", "image": img})
@@ -143,7 +151,7 @@ class PruneVidQwen25VL:
         )
 
         if video_path is not None:
-            # 视频处理
+            # 视频处理（已在_load_video中resize，无需额外参数）
             inputs = self.processor(
                 text=[text],
                 images=None,
@@ -152,7 +160,7 @@ class PruneVidQwen25VL:
                 return_tensors="pt",
             ).to(self.device, dtype=self.torch_dtype)
         else:
-            # 图片处理
+            # 图片处理（像素参数已在messages中设置）
             inputs = self.processor(
                 text=[text],
                 images=image_objects,
@@ -205,14 +213,14 @@ class PruneVidQwen25VL:
 
     def _load_video(self, video_path: str, max_frames: Optional[int] = None) -> List[Image.Image]:
         """
-        加载视频帧
+        加载视频帧并应用动态分辨率调整
 
         Args:
             video_path: 视频路径
             max_frames: 最大帧数，默认使用config中的设置
 
         Returns:
-            frames: PIL Image列表
+            frames: PIL Image列表（已resize）
         """
         if max_frames is None:
             max_frames = self.config.max_frames
@@ -238,6 +246,22 @@ class PruneVidQwen25VL:
         else:
             frame_indices = np.linspace(0, total_frames - 1, max_frames, dtype=int).tolist()
 
+        # 计算动态分辨率
+        # 注意：video_min_pixels和video_max_pixels是总像素预算（T×H×W），不是每帧！
+        nframes = len(frame_indices)
+        FRAME_FACTOR = 2  # Qwen2.5-VL的帧因子
+
+        # 使用总像素预算上限
+        total_pixels_budget = self.config.video_max_pixels
+
+        # 计算每帧可用的像素数：总预算 / 帧数 × FRAME_FACTOR
+        max_pixels_per_frame = int(total_pixels_budget / nframes * FRAME_FACTOR)
+
+        print(f"动态分辨率配置:")
+        print(f"  - 总预算: {total_pixels_budget:,} 像素 (约 {total_pixels_budget/(32*32):.0f} tokens)")
+        print(f"  - 帧数: {nframes}")
+        print(f"  - 每帧分配: {max_pixels_per_frame:,} 像素 (约 {max_pixels_per_frame/784:.1f} tokens/帧)")
+        print(f"  - 预计总tokens: {nframes * max_pixels_per_frame / 784:.0f}")
         frames = []
         for idx in frame_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -247,12 +271,58 @@ class PruneVidQwen25VL:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 # 转为PIL Image
                 pil_image = Image.fromarray(frame_rgb)
-                frames.append(pil_image)
+
+                # 应用smart_resize：保持宽高比，调整到目标像素数，宽高对齐到28
+                resized_image = self._smart_resize(pil_image, max_pixels_per_frame, factor=28)
+                frames.append(resized_image)
 
         cap.release()
 
-        print(f"加载了 {len(frames)} 帧")
+        print(f"加载了 {len(frames)} 帧 (resize后: {frames[0].size if frames else 'N/A'})")
         return frames
+
+    def _smart_resize(self, image: Image.Image, target_pixels: int, factor: int = 28) -> Image.Image:
+        """
+        智能resize图片：保持宽高比，调整到目标像素数，宽高对齐到factor的倍数
+
+        这是Qwen2.5-VL的核心resize算法
+
+        Args:
+            image: PIL Image
+            target_pixels: 目标像素数
+            factor: 对齐因子（Qwen2.5-VL使用28）
+
+        Returns:
+            resized_image: resize后的PIL Image
+        """
+        import math
+
+        width, height = image.size
+        current_pixels = width * height
+
+        # 计算缩放比例
+        if current_pixels > target_pixels:
+            # 需要缩小
+            scale = math.sqrt(target_pixels / current_pixels)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+        else:
+            # 不需要缩放或放大（通常视频帧会比target_pixels大）
+            new_width = width
+            new_height = height
+
+        # 对齐到factor的倍数（向下取整）
+        new_width = (new_width // factor) * factor
+        new_height = (new_height // factor) * factor
+
+        # 确保至少是1个factor
+        new_width = max(factor, new_width)
+        new_height = max(factor, new_height)
+
+        # Resize
+        resized = image.resize((new_width, new_height), Image.Resampling.BICUBIC)
+
+        return resized
 
     def _print_stats(self, stats: Dict):
         """打印统计信息"""
